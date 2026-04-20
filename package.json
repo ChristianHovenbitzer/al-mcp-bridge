@@ -1,0 +1,31 @@
+{
+  "name": "al-mcp-bridge",
+  "version": "0.1.0",
+  "description": "MCP server bridging AI agents to the AL language server for semantic AL code authoring and refactoring.",
+  "type": "module",
+  "bin": {
+    "al-mcp-bridge": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "keywords": ["mcp", "al", "business-central", "dynamics-nav", "lsp", "refactoring"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "vscode-jsonrpc": "^8.2.1",
+    "vscode-languageserver-protocol": "^3.17.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "typescript": "^5.6.3"
+  }
+}
