@@ -1,0 +1,15 @@
+{
+  "_comment": "Drop this into the project's .mcp.json (shared via git), or merge under the same mcpServers key in ~/.claude.json for a user-wide install. AL_CODE_ANALYZERS is optional — set it to a ;-delimited list of analyzer DLL paths (ALCops, LinterCop) to enable third-party diagnostics and quickfixes.",
+  "mcpServers": {
+    "al": {
+      "command": "node",
+      "args": ["C:/git/al-mcp-bridge/dist/index.js"],
+      "env": {
+        "AL_LS_PATH": "C:/Users/YOU/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/win32/Microsoft.Dynamics.Nav.EditorServices.Host.exe",
+        "AL_WORKSPACE": "C:/path/to/your/al/project",
+        "AL_PACKAGE_CACHE": "C:/path/to/your/al/project/.alpackages",
+        "AL_CODE_ANALYZERS": ""
+      }
+    }
+  }
+}

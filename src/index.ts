@@ -12,15 +12,31 @@ async function main(): Promise<void> {
   process.stderr.write(
     `[al-mcp-bridge] starting AL LS: ${config.languageServerPath}\n`,
   );
-  process.stderr.write(`[al-mcp-bridge] workspace: ${config.workspaceRoot}\n`);
+  process.stderr.write(
+    `[al-mcp-bridge] ${config.workspaceFolders.length} AL project(s) discovered:\n`,
+  );
+  for (const f of config.workspaceFolders) {
+    process.stderr.write(`[al-mcp-bridge]   - ${f}\n`);
+  }
 
-  await lsp.start();
+  // Kick LSP init in the background so MCP is responsive immediately;
+  // tool calls await `lspReady` individually.
+  const lspReady = lsp.start().then(
+    (r) => {
+      process.stderr.write(`[al-mcp-bridge] LSP initialized\n`);
+      return r;
+    },
+    (err) => {
+      process.stderr.write(`[al-mcp-bridge] LSP init failed: ${err?.message ?? err}\n`);
+      throw err;
+    },
+  );
 
   const mcp = new McpServer(
     { name: "al-mcp-bridge", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
-  registerTools(mcp, lsp, config);
+  registerTools(mcp, lsp, config, lspReady);
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);

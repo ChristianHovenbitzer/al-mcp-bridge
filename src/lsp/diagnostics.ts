@@ -11,6 +11,12 @@ export class DiagnosticsCache {
 
   ingest(params: PublishDiagnosticsParams): void {
     this.byUri.set(params.uri, params.diagnostics);
+    if (process.env.AL_BRIDGE_DEBUG_DIAGS) {
+      const codes = params.diagnostics.map((d) => String(d.code ?? "?")).join(",");
+      process.stderr.write(
+        `[al-mcp-bridge] publishDiagnostics uri=${params.uri} n=${params.diagnostics.length} codes=[${codes}]\n`,
+      );
+    }
     const waiting = this.waiters.get(params.uri);
     if (waiting && waiting.length) {
       this.waiters.set(params.uri, []);
@@ -18,8 +24,21 @@ export class DiagnosticsCache {
     }
   }
 
+  /** Debug: snapshot of every URI currently cached and its diagnostic count. */
+  snapshotSummary(): Array<{ uri: string; count: number; codes: string[] }> {
+    return Array.from(this.byUri.entries()).map(([uri, ds]) => ({
+      uri,
+      count: ds.length,
+      codes: ds.map((d) => String(d.code ?? "?")),
+    }));
+  }
+
   current(uri: string): Diagnostic[] {
     return this.byUri.get(uri) ?? [];
+  }
+
+  hasPublishedFor(uri: string): boolean {
+    return this.byUri.has(uri);
   }
 
   /**

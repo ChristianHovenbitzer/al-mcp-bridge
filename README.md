@@ -114,37 +114,31 @@ diagnostics, `didClose`. Good enough for first iteration.
 Names follow the existing `al_*` convention so they sit naturally next to
 `al_symbolsearch`, `al_compile`, etc.
 
-### Discovery
-- `al_list_objects(filter?)` — list AL objects via `al/getApplicationObjects`
-- `al_get_object(type, id|name)` — full metadata via `al/getApplicationObject`
-- `al_list_event_publishers(objectFilter?)` — via `al/getEventPublishersRequest`
-- `al_symbol_search(query, filters)` — forwards to `al/symbolSearch`
+### Shipped (callable today)
+- `al_list_objects` — AL objects via `al/getApplicationObjects`
+- `al_symbol_search` — forwards to `al/symbolSearch` (filter by kind, scope, access, …)
+- `al_get_symbol_at` — combined hover + definition at (file, line, char)
+- `al_find_references` — `textDocument/references`
+- `al_document_outline` — `textDocument/documentSymbol`
+- `al_apply_edit` — full-text replace + fresh diagnostics in the same call
+  (set `persist=false` for preview mode, in-memory only)
+- `al_get_diagnostics` — current cached diagnostics, optional `waitForFresh`
+- `al_format` — full-document or range formatting
+- `al_rename` — semantic rename, returns a `WorkspaceEdit` for review. Does
+  **not** auto-apply — feed the resulting text through `al_apply_edit`.
+- `al_list_code_actions` — `textDocument/codeAction` over a range; filterable
+  by `only` (e.g. `['quickfix']`). Works with loaded analyzer DLLs (ALCops,
+  LinterCop) configured via `al.codeAnalyzers` in `.vscode/settings.json`.
+- `al_run_code_action` — executes one, applies the resulting `WorkspaceEdit`,
+  returns per-file before/after + fresh diagnostics.
 
-### Semantic query
-- `al_get_symbol_at(file, offset)` — combines `hover` + `definition` +
-  optional reference count. Saves the AI from re-reading whole files.
-- `al_find_references(file, offset)` — `textDocument/references`
-- `al_document_outline(file)` — `textDocument/documentSymbol`
-
-### Edit loop (core value)
-- `al_preview_edit(file, edits[])` — `didChange` → await diagnostics →
-  return `{ diagnostics, newText }` without persisting
-- `al_apply_edit(file, edits[])` — preview + commit to disk + re-diagnose
-- `al_get_diagnostics(file | project)` — current cached diagnostics
-- `al_format(file, range?)` — returns formatted text
-
-### Refactor
-- `al_rename(file, offset, newName)` — `textDocument/rename`, returns
-  `WorkspaceEdit` for review. Does **not** auto-apply.
-- `al_list_code_actions(file, range)` — `textDocument/codeAction`, filter
-  out the ones an AI shouldn't trigger blindly (e.g. pragma-suppress)
-- `al_run_code_action(file, range, identifier)` — `al/runCodeAction`
-- `al_check_symbols(file)` — `al/checkSymbols`
-
-### Later / out of MVP
-- `al_extract_method`, `al_inline` — need C# in-proc primitives
-- `al_test_run(snippet)` — stands up a transient runner (see AL.Runner for
-  inspiration) to actually execute generated code without a BC Service Tier
+### Planned
+- `al_list_event_publishers` — via `al/getEventPublishersRequest`
+- `al_check_symbols` — via `al/checkSymbols`, post-edit validation
+- `al_test_run(snippet)` — wrap `BusinessCentral.AL.Runner` to execute
+  generated code without a BC Service Tier
+- `al_extract_method`, `al_inline` — need C# in-proc primitives (out of scope
+  for the LSP bridge)
 
 ---
 
@@ -202,30 +196,197 @@ which LSP already externalizes for us.
 
 ## 8. Milestones
 
-1. **M1 — spawn & handshake.** Locate AL LS, `initialize`, accept a workspace
-   path from config. Ship `al_document_outline` as smoke test.
-2. **M2 — edit loop.** `al_apply_edit` + `al_preview_edit` +
-   `al_get_diagnostics`. This is the unlock for every other AI-authored
-   change.
-3. **M3 — semantic query.** `al_find_references`, `al_get_symbol_at`,
-   `al_rename`.
-4. **M4 — discovery.** `al_symbol_search`, `al_list_objects`,
-   `al_list_event_publishers`.
-5. **M5 — code actions.** `al_list_code_actions`, `al_run_code_action`,
-   `al_format`.
-6. **M6 — optional runner.** Wrap `BusinessCentral.AL.Runner` for
+1. **M1 — spawn & handshake.** ✅ Locate AL LS, `initialize`,
+   `al/setActiveWorkspace`. `al_document_outline` as smoke test.
+2. **M2 — edit loop.** ✅ `al_apply_edit` + `al_get_diagnostics`. Preview
+   mode via `persist=false`.
+3. **M3 — semantic query.** ✅ `al_find_references`, `al_get_symbol_at`,
+   `al_rename`, `al_format`.
+4. **M4 — discovery.** ✅ `al_symbol_search`, `al_list_objects`.
+5. **M5 — code actions.** ✅ `al_list_code_actions`, `al_run_code_action`
+   (handles AL's reverse-`workspace/applyEdit` protocol). Analyzer loading
+   from `.vscode/settings.json` (`al.codeAnalyzers`, ALCops, LinterCop).
+6. **M5.1 — remaining.** `al_list_event_publishers`, `al_check_symbols`.
+7. **M6 — optional runner.** Wrap `BusinessCentral.AL.Runner` for
    `al_test_run` behavioural validation.
 
 ---
 
-## 9. Local dev
+## 9. Quick start
 
+### Prerequisites
+- **Node 20+**
+- **Microsoft AL VS Code extension installed** — the bridge spawns the AL
+  language server binary shipped with it. Install from the Marketplace
+  (`ms-dynamics-smb.al`) if you haven't; you don't need VS Code to be
+  running.
+- **An AL project** with an `app.json` at its root and a populated
+  `.alpackages/` folder (run *AL: Download symbols* in VS Code once to
+  populate it, or copy from another project).
+
+### Install & build
 ```bash
+git clone <this-repo>
+cd al-mcp-bridge
 npm install
 npm run build
-AL_LS_PATH="C:/Users/you/.vscode/extensions/ms-dynamics-smb.al-<ver>/bin/Microsoft.Dynamics.Nav.EditorServices.Host.exe" \
-AL_WORKSPACE="C:/path/to/your/al/project" \
-node dist/index.js
 ```
 
-Claude Code / Claude Desktop registration example in `examples/mcp.json`.
+### Locate the AL language server
+The binary lives inside the installed extension:
+
+```bash
+# Windows (bash/git-bash)
+ls ~/AppData/Roaming/Code/User/globalStorage/  # not this one — actual path:
+ls "$USERPROFILE/.vscode/extensions" | grep ms-dynamics-smb.al
+# → ms-dynamics-smb.al-17.0.2273547   (pick the newest)
+# Full path:
+# C:/Users/<you>/.vscode/extensions/ms-dynamics-smb.al-<ver>/bin/win32/Microsoft.Dynamics.Nav.EditorServices.Host.exe
+
+# Linux / macOS
+ls ~/.vscode/extensions | grep ms-dynamics-smb.al
+# binary under bin/linux/ or bin/darwin/
+```
+
+If you skip `AL_LS_PATH`, the bridge auto-detects the newest install under
+`~/.vscode/extensions/ms-dynamics-smb.al-*/bin/`.
+
+### Environment variables
+
+| Var | Required | Purpose |
+|---|---|---|
+| `AL_LS_PATH` | no (autodetect) | Absolute path to `Microsoft.Dynamics.Nav.EditorServices.Host(.exe)` |
+| `AL_WORKSPACE` | **yes** | Absolute path to your AL project root (the folder containing `app.json`) |
+| `AL_PACKAGE_CACHE` | **yes** | Absolute path to `.alpackages` (semicolon-separated for multiple) — without this, BC symbols won't resolve and most tools return empty |
+| `AL_DIAGNOSTICS_SETTLE_MS` | no (default `750`) | How long `al_apply_edit` waits for the next `publishDiagnostics` before returning |
+
+### Analyzer configuration (from `.vscode/settings.json`)
+
+The bridge reads analyzer configuration from `<AL_WORKSPACE>/.vscode/settings.json` — the same file VS Code reads. No env vars, no duplication. Supported keys:
+
+| Key | Purpose |
+|---|---|
+| `al.codeAnalyzers` | Array of analyzer DLLs. Supports the same placeholders VS Code does: `${analyzerFolder}`, `${AppSourceCop}`, `${CodeCop}`, `${PerTenantExtensionCop}`, `${UICop}`, `${workspaceFolder}`, `${alWorkspaceFolder}` |
+| `al.enableCodeAnalysis` | Master switch. Default `true` |
+| `al.enableCodeActions` | Enable `textDocument/codeAction`. Default `true` |
+| `al.backgroundCodeAnalysis` | `"File"`, `"Project"`, or `"Off"`. Default `"File"`. Set to `"Project"` to run LinterCop-style analyzers across the whole project and surface their diagnostics without opening every file |
+| `al.ruleSetPath` | Path to a `*.ruleset.json` (relative to workspace root or absolute). Filters and tunes severities |
+| `al.assemblyProbingPaths` | Extra directories the CLR scans for analyzer-referenced DLLs. Merged with auto-detected analyzer directories |
+
+The bridge automatically adds every analyzer's parent directory to `assemblyProbingPaths` so sibling helper DLLs resolve. If LinterCop is enabled, `Microsoft.Dynamics.Nav.Analyzers.Common.dll` (the helper it depends on) is auto-included in the analyzer list — without this, Roslyn's per-entry `AssemblyLoadContext` isolation causes LinterCop to fail at probe time with `AD0001` and no rules fire.
+
+### Smoke test
+
+End-to-end check against a real AL file (verifies LSP handshake, tool
+registration, and `al/getApplicationObjects` + `textDocument/documentSymbol`
+responses):
+
+```bash
+AL_WORKSPACE="C:/path/to/your/al/project" \
+AL_PACKAGE_CACHE="C:/path/to/your/al/project/.alpackages" \
+node scripts/smoke.mjs "C:/path/to/your/al/project/src/some.al"
+```
+
+Expected: 9 tools listed, non-empty `al_list_objects`, outline tree with
+your object(s) and their members.
+
+---
+
+## 10. Claude Code integration
+
+The bridge is a stdio MCP server. Claude Code picks it up via any of the
+standard MCP registration paths.
+
+### Option A: project-local (recommended for a team)
+
+Commit an `.mcp.json` at your **AL project** root (the folder containing
+`app.json` — *not* this repo):
+
+```json
+{
+  "mcpServers": {
+    "al": {
+      "command": "node",
+      "args": ["C:/git/al-mcp-bridge/dist/index.js"],
+      "env": {
+        "AL_WORKSPACE": "${workspaceFolder}",
+        "AL_PACKAGE_CACHE": "${workspaceFolder}/.alpackages"
+      }
+    }
+  }
+}
+```
+
+Claude Code will prompt on first launch to trust the new MCP server. After
+that, the `al_*` tools appear in `/tools` and are callable from any prompt.
+
+### Option B: user-wide
+
+Add the same `mcpServers.al` block to `~/.claude.json` (Windows:
+`%USERPROFILE%/.claude.json`). The server is then available in every
+session, regardless of working directory. Useful if you hop between
+multiple AL projects — just set `AL_WORKSPACE` via the shell before
+launching Claude Code, or keep it unset and let each project override via
+its own `.mcp.json`.
+
+### Option C: `claude mcp add`
+
+One-shot registration from the CLI:
+
+```bash
+claude mcp add al -- node C:/git/al-mcp-bridge/dist/index.js
+# then set env vars in ~/.claude.json under mcpServers.al.env
+```
+
+### Verifying it's live
+
+Inside a Claude Code session, in the working directory of your AL project:
+
+```
+/mcp
+```
+
+You should see `al` listed with 11 tools. Try:
+
+> "List all codeunits in this workspace and show me the outline of
+> src/pageextension/CustomerListExt.PageExt.al"
+
+The agent should call `al_list_objects` (filtered) and
+`al_document_outline` and return structured results.
+
+### Enabling ALCops / LinterCop quickfixes
+
+Analyzer configuration lives in `<workspace>/.vscode/settings.json`, so the same file that drives your VS Code editor experience drives the bridge:
+
+```jsonc
+{
+  "al.codeAnalyzers": [
+    "${CodeCop}",
+    "${UICop}",
+    "${analyzerFolder}BusinessCentral.LinterCop.dll",
+    "${analyzerFolder}ALCops.dll"
+  ],
+  "al.enableCodeAnalysis": true,
+  "al.enableCodeActions": true,
+  "al.backgroundCodeAnalysis": "Project",
+  "al.ruleSetPath": ".codeanalyzer/SOCITAS.ruleset.json"
+}
+```
+
+Restart Claude Code. Ask the agent to run `al_list_code_actions` over a range that trips an analyzer rule; the returned list should include entries from those DLLs. Feed the `identifier` into `al_run_code_action` to execute the fix.
+
+`al_get_diagnostics` surfaces every active rule — compiler (`AL*`), CodeCop (`AA*`), LinterCop (`LC*`), ALCops (`PC*`), AppSourceCop (`AS*`), etc. Set `backgroundCodeAnalysis` to `"Project"` when you want project-wide diagnostics without opening each file.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `al_list_objects` returns `null` or empty | Workspace didn't load — usually missing/wrong `AL_WORKSPACE` or no `app.json` at that path | Point `AL_WORKSPACE` at the folder containing `app.json` |
+| `al_document_outline` returns `{outline: []}` on a non-empty file | `.alpackages` missing or wrong; LS couldn't bind project references | Run *AL: Download symbols* in VS Code on the same project, verify `.alpackages/*.app` files exist, point `AL_PACKAGE_CACHE` at that folder |
+| Bridge hangs on startup, no stderr | AL LS binary path wrong | Check `AL_LS_PATH` or unset it to use autodetect |
+| ALCops rules don't appear in `al_list_code_actions` | Analyzer DLL path wrong in `al.codeAnalyzers`, or analyzer has diagnostics but no `CodeFixProvider` for the specific rule | Verify the DLL path in `.vscode/settings.json`; try a rule you know ships a CodeFix |
+| `al_get_diagnostics` shows `AD0001 … Could not load file or assembly Microsoft.Dynamics.Nav.Analyzers.Common` on `app.json`, no LinterCop/ALCops diagnostics appear | Roslyn's per-entry `AssemblyLoadContext` couldn't resolve a sibling helper DLL at analyzer probe time | The bridge now auto-includes `Microsoft.Dynamics.Nav.Analyzers.Common.dll` whenever LinterCop is in `al.codeAnalyzers`. If you still see this on a different analyzer, add the missing sibling DLL to `al.codeAnalyzers` explicitly so it co-loads in the shared ALC |
+| LinterCop rules missing on files you haven't opened | `al.backgroundCodeAnalysis` set to `"File"` (default) | Set `"al.backgroundCodeAnalysis": "Project"` in `.vscode/settings.json` |
+| Claude doesn't see the tools | MCP server crashed on launch | Check Claude Code's MCP logs (`/mcp` shows status); run the smoke test standalone to isolate |
+
+See [`examples/mcp.json`](examples/mcp.json) for a complete annotated config.
