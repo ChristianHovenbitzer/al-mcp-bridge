@@ -1,0 +1,14 @@
+{
+  // Bridge resolves ${analyzerFolder} by walking up from AL_LS_PATH. Works
+  // for both VS Code installs and our extracted-VSIX layout.
+  "al.codeAnalyzers": [
+    "${analyzerFolder}Microsoft.Dynamics.Nav.CodeCop.dll",
+    "${analyzerFolder}Microsoft.Dynamics.Nav.AppSourceCop.dll",
+    "${analyzerFolder}Microsoft.Dynamics.Nav.UICop.dll",
+    "${analyzerFolder}Microsoft.Dynamics.Nav.PerTenantExtensionCop.dll",
+    "${analyzerFolder}ALCops.LinterCop.dll"
+  ],
+  "al.enableCodeAnalysis": true,
+  "al.enableCodeActions": true,
+  "al.backgroundCodeAnalysis": "File"
+}

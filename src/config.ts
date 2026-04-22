@@ -1,5 +1,6 @@
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
 export interface BridgeConfig {
@@ -206,15 +207,16 @@ export function loadConfig(): BridgeConfig {
 
   let codeAnalyzers: string[] = [];
   if (enableCodeAnalysis) {
-    const raw = readStringArray(settings, "al.codeAnalyzers") ?? [];
-    codeAnalyzers = resolveCodeAnalyzers(raw, ctx);
-    codeAnalyzers = augmentWithLinterCopSiblings(codeAnalyzers);
+    const fromSettings = readStringArray(settings, "al.codeAnalyzers") ?? [];
+    const fromEnv = parseSemicolonList(process.env.AL_EXTRA_CODE_ANALYZERS);
+    codeAnalyzers = resolveCodeAnalyzers([...fromSettings, ...fromEnv], ctx);
+    codeAnalyzers = augmentWithAnalyzerSiblings(codeAnalyzers);
   }
 
   const backgroundCodeAnalysis =
     readString(settings, "al.backgroundCodeAnalysis") ?? "File";
 
-  const ruleSetPath = resolveRuleSetPath(settings, ctx);
+  const ruleSetPath = resolveEffectiveRuleSetPath(settings, ctx);
 
   const settingsProbingPaths = (readStringArray(settings, "al.assemblyProbingPaths") ?? [])
     .map((p) => resolvePlaceholders(p, ctx))
@@ -365,41 +367,160 @@ function resolveCodeAnalyzers(raw: string[], ctx: PlaceholderCtx): string[] {
 }
 
 /**
- * LinterCop depends on `Microsoft.Dynamics.Nav.Analyzers.Common.dll`, shipped
- * alongside it in the AL extension's Analyzers folder but not itself a
- * `DiagnosticAnalyzer`. Roslyn's analyzer loader isolates each entry in its
- * own ALC and does not probe the analyzer's folder, so LinterCop's
- * constructors throw `FileNotFoundException` (surfaced as `AD0001` on
- * `app.json`) unless the Common assembly is also in the analyzer list.
- * Co-listing forces the LS to load it into the shared ALC.
+ * Several analyzer DLLs depend on helper assemblies that ship beside them
+ * in the AL extension's `Analyzers/` folder but aren't themselves
+ * `DiagnosticAnalyzer` types:
+ *
+ *   - `Microsoft.Dynamics.Nav.CodeCop.dll` + other MS cops reach into
+ *     `Microsoft.Dynamics.Nav.Analyzers.Common.dll` (and sometimes
+ *     `Microsoft.Dynamics.Nav.AL.Common.dll`). Without them, specific
+ *     rules (e.g. `EmailAndPhoneNoMustNotBePresentInTheSource`) crash in
+ *     their `Initialize` override.
+ *   - `ALCops.LinterCop.dll` depends on `ALCops.Common.dll`.
+ *   - `BusinessCentral.LinterCop.dll` (community fork) depends on
+ *     `Microsoft.Dynamics.Nav.Analyzers.Common.dll`.
+ *
+ * Roslyn's analyzer loader puts each entry from `codeAnalyzers` in its own
+ * AssemblyLoadContext and does not probe the DLL's own folder for siblings.
+ * The fix is to list helper DLLs explicitly in `codeAnalyzers` so the LS
+ * loads them into the shared ALC where analyzer init code can resolve them.
+ * Every surfaced `AD0001 … Could not load file or assembly …Common…` error
+ * on `app.json` ultimately traces back to a sibling missing from this list.
  */
-function augmentWithLinterCopSiblings(codeAnalyzers: string[]): string[] {
-  const hasLinterCop = codeAnalyzers.some(
-    (p) => basename(p).toLowerCase() === "businesscentral.lintercop.dll",
-  );
-  if (!hasLinterCop) return codeAnalyzers;
+interface AnalyzerSiblingRule {
+  /** Matched against the lowercase basename of a configured analyzer DLL. */
+  match: RegExp;
+  /** Helper DLL filenames to co-load from the same folder (when present). */
+  siblings: string[];
+}
+
+const ANALYZER_SIBLING_RULES: AnalyzerSiblingRule[] = [
+  {
+    match: /^businesscentral\.lintercop\.dll$/,
+    siblings: ["Microsoft.Dynamics.Nav.Analyzers.Common.dll"],
+  },
+  {
+    match: /^alcops\..+\.dll$/,
+    siblings: ["ALCops.Common.dll"],
+  },
+  {
+    match: /^microsoft\.dynamics\.nav\.(codecop|appsourcecop|uicop|pertenantextensioncop)\.dll$/,
+    siblings: [
+      "Microsoft.Dynamics.Nav.Analyzers.Common.dll",
+      "Microsoft.Dynamics.Nav.AL.Common.dll",
+    ],
+  },
+  // Socitas.ReviewerCop is built on top of ALCops/Analyzers and ships both
+  // its own per-analyzer Common DLL and the ALCops helpers. Distinct from
+  // LinterCop because the analyzer isn't in the `alcops.` namespace even
+  // though it transitively depends on `ALCops.Common`.
+  {
+    match: /^socitas\.reviewercop\.dll$/,
+    siblings: [
+      "Socitas.ReviewerCop.Common.dll",
+      "ALCops.Common.dll",
+      "ALCops.CompanyCop.dll",
+    ],
+  },
+];
+
+function augmentWithAnalyzerSiblings(codeAnalyzers: string[]): string[] {
   const out = [...codeAnalyzers];
   const seen = new Set(out.map((p) => p.toLowerCase()));
-  for (const p of codeAnalyzers) {
-    if (basename(p).toLowerCase() !== "businesscentral.lintercop.dll") continue;
-    const common = join(dirname(p), "Microsoft.Dynamics.Nav.Analyzers.Common.dll");
-    const key = common.toLowerCase();
-    if (existsSync(common) && !seen.has(key)) {
-      seen.add(key);
-      out.push(common);
+  for (const analyzer of codeAnalyzers) {
+    const name = basename(analyzer).toLowerCase();
+    const dir = dirname(analyzer);
+    for (const rule of ANALYZER_SIBLING_RULES) {
+      if (!rule.match.test(name)) continue;
+      for (const sibling of rule.siblings) {
+        const p = join(dir, sibling);
+        const key = p.toLowerCase();
+        if (seen.has(key)) continue;
+        if (!existsSync(p)) continue;
+        seen.add(key);
+        out.push(p);
+      }
     }
   }
   return out;
 }
 
-function resolveRuleSetPath(
+/**
+ * Merge the workspace's `al.ruleSetPath` (if any) with every entry in
+ * `AL_EXTRA_RULESETS`. AL's `alResourceConfigurationSettings.ruleSetPath`
+ * takes a single file, so when multiple sources exist we synthesize a
+ * composite ruleset that `includedRuleSets`-chains them and point the LS at
+ * that. Zero / one source cases are passed through verbatim.
+ */
+function resolveEffectiveRuleSetPath(
   settings: Record<string, unknown> | undefined,
   ctx: PlaceholderCtx,
 ): string | undefined {
-  const value = readString(settings, "al.ruleSetPath");
-  if (!value) return undefined;
-  const expanded = resolvePlaceholders(value, ctx);
-  return isAbsolute(expanded) ? expanded : resolve(ctx.workspaceFolder, expanded);
+  const collected: string[] = [];
+
+  const fromSettings = readString(settings, "al.ruleSetPath");
+  if (fromSettings) {
+    const expanded = resolvePlaceholders(fromSettings, ctx);
+    const abs = isAbsolute(expanded) ? expanded : resolve(ctx.workspaceFolder, expanded);
+    if (existsSync(abs)) {
+      collected.push(abs);
+    } else {
+      process.stderr.write(
+        `[al-mcp-bridge] al.ruleSetPath not found, skipping: ${abs}\n`,
+      );
+    }
+  }
+
+  for (const entry of parseSemicolonList(process.env.AL_EXTRA_RULESETS)) {
+    const expanded = resolvePlaceholders(entry, ctx);
+    const abs = isAbsolute(expanded) ? expanded : resolve(ctx.workspaceFolder, expanded);
+    if (!existsSync(abs)) {
+      process.stderr.write(
+        `[al-mcp-bridge] AL_EXTRA_RULESETS entry not found, skipping: ${abs}\n`,
+      );
+      continue;
+    }
+    if (collected.some((p) => p.toLowerCase() === abs.toLowerCase())) continue;
+    collected.push(abs);
+  }
+
+  if (collected.length === 0) return undefined;
+  if (collected.length === 1) return collected[0];
+  return writeCompositeRuleSet(collected, ctx.workspaceFolder);
+}
+
+/**
+ * Emit a synthesized ruleset that chains each source through
+ * `includedRuleSets`. Written under the OS temp directory with a stable
+ * per-workspace hash so repeated runs reuse the same file and multiple
+ * workspaces don't collide. Every included path is absolute, so the
+ * composite's location doesn't constrain resolution.
+ */
+function writeCompositeRuleSet(paths: string[], workspaceRoot: string): string {
+  const hash = createHash("sha1").update(workspaceRoot).digest("hex").slice(0, 8);
+  const dir = join(tmpdir(), "al-mcp-bridge");
+  const file = join(dir, `${hash}.merged.ruleset.json`);
+  const body = {
+    name: "al-mcp-bridge merged ruleset",
+    description:
+      "Auto-generated. Composes al.ruleSetPath with AL_EXTRA_RULESETS entries.",
+    includedRuleSets: paths.map((p) => ({ path: p, action: "Default" })),
+  };
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(file, JSON.stringify(body, null, 2), "utf8");
+  } catch (err) {
+    process.stderr.write(
+      `[al-mcp-bridge] failed to write merged ruleset at ${file}: ${(err as Error).message}\n`,
+    );
+    return paths[0]!;
+  }
+  return file;
+}
+
+function parseSemicolonList(v: string | undefined): string[] {
+  if (!v) return [];
+  return v.split(";").map((s) => s.trim()).filter(Boolean);
 }
 
 function uniqueDirs(filePaths: string[]): string[] {

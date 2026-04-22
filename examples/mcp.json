@@ -1,5 +1,5 @@
 {
-  "_comment": "Drop this into the project's .mcp.json (shared via git), or merge under the same mcpServers key in ~/.claude.json for a user-wide install. AL_CODE_ANALYZERS is optional — set it to a ;-delimited list of analyzer DLL paths (ALCops, LinterCop) to enable third-party diagnostics and quickfixes.",
+  "_comment": "Drop this into the project's .mcp.json (shared via git), or merge under the same mcpServers key in ~/.claude.json for a user-wide install. Primary analyzer config lives in .vscode/settings.json (al.codeAnalyzers, al.ruleSetPath). AL_EXTRA_CODE_ANALYZERS and AL_EXTRA_RULESETS are optional and stack ON TOP of those — use them to force-enable a custom linter (with its quickfixes) or an extra ruleset regardless of what VS Code has configured. Both are ;-delimited and support the same ${analyzerFolder}/${workspaceFolder}/etc. placeholders as settings.json.",
   "mcpServers": {
     "al": {
       "command": "node",
@@ -8,7 +8,8 @@
         "AL_LS_PATH": "C:/Users/YOU/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/win32/Microsoft.Dynamics.Nav.EditorServices.Host.exe",
         "AL_WORKSPACE": "C:/path/to/your/al/project",
         "AL_PACKAGE_CACHE": "C:/path/to/your/al/project/.alpackages",
-        "AL_CODE_ANALYZERS": ""
+        "AL_EXTRA_CODE_ANALYZERS": "",
+        "AL_EXTRA_RULESETS": ""
       }
     }
   }

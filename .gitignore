@@ -6,3 +6,16 @@ dist/
 .vscode/
 .idea/
 coverage/
+
+# AL language server + analyzers are not committed; the install script
+# populates them into tests/.al-ls/ per the pinned version in package.json.
+tests/.al-ls/
+
+# AL LS writes a per-workspace test runner config when spun up against a
+# fixture. Not meaningful for source control.
+.altestrunner/
+
+# Fixture projects ship their own .vscode/settings.json, so override the
+# blanket .vscode/ ignore above.
+!tests/fixtures/**/.vscode/
+!tests/fixtures/**/.vscode/**

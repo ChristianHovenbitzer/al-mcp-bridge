@@ -1,0 +1,20 @@
+{
+  "id": "aa111111-2222-3333-4444-555566667777",
+  "name": "analyzers-sanity",
+  "publisher": "al-mcp-bridge tests",
+  "version": "1.0.0.0",
+  "brief": "Fixture: intentionally trips MS CodeCop + ALCops.LinterCop rules so diagnostics tests can assert on them.",
+  "description": "Not a shippable extension. Exists only for the e2e test suite.",
+  "platform": "1.0.0.0",
+  "application": "1.0.0.0",
+  "idRanges": [
+    {
+      "from": 50100,
+      "to": 50149
+    }
+  ],
+  "runtime": "13.0",
+  "features": [
+    "NoImplicitWith"
+  ]
+}

@@ -258,6 +258,8 @@ If you skip `AL_LS_PATH`, the bridge auto-detects the newest install under
 | `AL_LS_PATH` | no (autodetect) | Absolute path to `Microsoft.Dynamics.Nav.EditorServices.Host(.exe)` |
 | `AL_WORKSPACE` | **yes** | Absolute path to your AL project root (the folder containing `app.json`) |
 | `AL_PACKAGE_CACHE` | **yes** | Absolute path to `.alpackages` (semicolon-separated for multiple) — without this, BC symbols won't resolve and most tools return empty |
+| `AL_EXTRA_CODE_ANALYZERS` | no | Semicolon-separated list of analyzer DLLs to load **in addition to** `al.codeAnalyzers` from `.vscode/settings.json`. Supports the same `${analyzerFolder}` / `${workspaceFolder}` / `${CodeCop}` / etc. placeholders |
+| `AL_EXTRA_RULESETS` | no | Semicolon-separated list of `*.ruleset.json` paths to apply **in addition to** `al.ruleSetPath`. If more than one ruleset is in play (settings + extras), the bridge synthesizes a composite that `includedRuleSets`-chains them and points the LS at it |
 | `AL_DIAGNOSTICS_SETTLE_MS` | no (default `750`) | How long `al_apply_edit` waits for the next `publishDiagnostics` before returning |
 
 ### Analyzer configuration (from `.vscode/settings.json`)
@@ -274,6 +276,28 @@ The bridge reads analyzer configuration from `<AL_WORKSPACE>/.vscode/settings.js
 | `al.assemblyProbingPaths` | Extra directories the CLR scans for analyzer-referenced DLLs. Merged with auto-detected analyzer directories |
 
 The bridge automatically adds every analyzer's parent directory to `assemblyProbingPaths` so sibling helper DLLs resolve. If LinterCop is enabled, `Microsoft.Dynamics.Nav.Analyzers.Common.dll` (the helper it depends on) is auto-included in the analyzer list — without this, Roslyn's per-entry `AssemblyLoadContext` isolation causes LinterCop to fail at probe time with `AD0001` and no rules fire.
+
+**Forcing extra analyzers / rulesets (env var overlay).** When you want a linter enabled *regardless* of what VS Code has in `.vscode/settings.json` — typical case: enforcing a house linter with quickfixes on every AL project — set `AL_EXTRA_CODE_ANALYZERS` and/or `AL_EXTRA_RULESETS` on the MCP server itself. These stack on top of the workspace settings; they don't replace them. Example:
+
+```jsonc
+// .mcp.json
+{
+  "mcpServers": {
+    "al": {
+      "command": "node",
+      "args": ["C:/git/al-mcp-bridge/dist/index.js"],
+      "env": {
+        "AL_WORKSPACE": "${workspaceFolder}",
+        "AL_PACKAGE_CACHE": "${workspaceFolder}/.alpackages",
+        "AL_EXTRA_CODE_ANALYZERS": "${analyzerFolder}BusinessCentral.LinterCop.dll;C:/team/analyzers/HouseRules.dll",
+        "AL_EXTRA_RULESETS": "C:/team/rulesets/house.ruleset.json;${workspaceFolder}/.codeanalyzer/project.ruleset.json"
+      }
+    }
+  }
+}
+```
+
+Entries are semicolon-separated, support the same placeholders as `.vscode/settings.json`, and missing paths log a warning to stderr and are skipped. When multiple rulesets are active, the bridge writes a composite ruleset under the OS temp dir that chains each source via `includedRuleSets` and passes that path to the LS — a single `ruleSetPath` is all the LSP accepts.
 
 ### Smoke test
 
