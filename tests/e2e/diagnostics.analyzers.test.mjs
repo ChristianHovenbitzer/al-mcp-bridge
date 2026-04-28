@@ -9,10 +9,12 @@
  *
  * Rule inventory (empirically confirmed against AL 17.0.2273547):
  *
- *   CodeCop        AA0137  warning  Codeunit    unused local variable
- *   AppSourceCop   AS0062  error    Page        field/action needs ApplicationArea
- *   UICop          AW0006  info     Page        page needs UsageCategory+ApplicationArea
- *   PerTenantExt   PTE0008 error    Page        field/action needs ApplicationArea
+ *   CodeCop        AA0137  warning  Codeunit       unused local variable
+ *   AppSourceCop   AS0062  error    Page           field/action needs ApplicationArea
+ *   UICop          AW0006  info     Page           page needs UsageCategory+ApplicationArea
+ *   PerTenantExt   PTE0008 error    Page           field/action needs ApplicationArea
+ *   ApplicationCop AC0009  warning  PermissionSet  caption needs MaxLength=30 or Locked=true
+ *   AL compiler    AL0305  error    PermissionSet  object identifier length > 20 chars
  *
  * A separate test tracks the third-party ALCops.LinterCop loader bug
  * (AD0001 — `ALCops.Common` can't resolve) so regressions there don't hide
@@ -39,6 +41,7 @@ const CODEUNIT_FILE = join(FIXTURE, "src", "Diagnostics.Codeunit.al");
 const PAGE_FILE = join(FIXTURE, "src", "Diagnostics.Page.al");
 const TABLE_FILE = join(FIXTURE, "src", "Diagnostics.Table.al");
 const TRIGGERS_FILE = join(FIXTURE, "src", "Diagnostics.Triggers.Codeunit.al");
+const PERMISSIONSET_FILE = join(FIXTURE, "src", "Diagnostics.PermissionSet.al");
 
 let bridge;
 
@@ -49,7 +52,7 @@ before(async () => {
   });
   // Prime every AL file once so the LS opens and schedules an analyzer pass
   // on each. Individual tests then await the specific rule they care about.
-  for (const file of [CODEUNIT_FILE, PAGE_FILE, TABLE_FILE, TRIGGERS_FILE]) {
+  for (const file of [CODEUNIT_FILE, PAGE_FILE, TABLE_FILE, TRIGGERS_FILE, PERMISSIONSET_FILE]) {
     await bridge.callTool("al_get_diagnostics", { file, waitForFresh: true });
   }
 });
@@ -179,6 +182,58 @@ test(
   },
 );
 
+// Permission set length rules. Two rules from two different sources:
+//   AL0305 — AL compiler error, fires when the object identifier exceeds
+//            20 chars. Proves AL-compiler diagnostics flow through the
+//            bridge alongside analyzer diagnostics.
+//   AC0009 — ALCops.ApplicationCop warning, fires on every permissionset
+//            Caption that lacks `MaxLength=30` or `Locked=true` (so the
+//            caption is safe against over-long translations). Fires
+//            regardless of the literal caption length — it's a discipline
+//            rule, not a string-length check.
+// ApplicationCop isn't loaded by default in many AL projects; we load it
+// explicitly in tests/fixtures/analyzers-sanity/.vscode/settings.json so
+// this test can pin the behavior.
+test("permission set: AL compiler surfaces AL0305 on object name > 20 chars", { timeout: 90_000 }, async () => {
+  const match = await findOrDump(
+    PERMISSIONSET_FILE,
+    (d) => d.code === "AL0305",
+    "AL0305 (object identifier length > 20) on permission set",
+  );
+  assert.equal(match.code, "AL0305");
+  assert.equal(match.severity, "error", `AL0305 is a compiler error, got ${match.severity}`);
+  assert.match(
+    match.message,
+    /cannot exceed 20 characters/i,
+    `AL0305 message should state the 20-char limit, got: ${match.message}`,
+  );
+  assert.match(
+    match.message,
+    /Diag Sanity PermSet Name Way Too Long/,
+    `AL0305 message should name the offending identifier, got: ${match.message}`,
+  );
+});
+
+test("permission set: ApplicationCop surfaces AC0009 warning on Caption without MaxLength/Locked", { timeout: 90_000 }, async () => {
+  const match = await findOrDump(
+    PERMISSIONSET_FILE,
+    (d) => d.code === "AC0009",
+    "AC0009 (permission set caption length) on permission set",
+  );
+  assert.equal(match.code, "AC0009");
+  assert.equal(match.severity, "warning", `AC0009 severity should be warning, got ${match.severity}`);
+  assert.match(
+    match.message,
+    /Caption of permissionset/i,
+    `AC0009 message should reference the permissionset Caption, got: ${match.message}`,
+  );
+  assert.match(
+    match.message,
+    /MaxLength=30|Locked=true/,
+    `AC0009 message should point to the MaxLength/Locked escape hatches, got: ${match.message}`,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -195,4 +250,28 @@ async function findDiagnostic(file, predicate) {
     },
     { timeoutMs: 60_000, intervalMs: 1000, label: `diagnostic on ${file}` },
   );
+}
+
+/**
+ * Like `findDiagnostic`, but on timeout the error message lists every
+ * diagnostic currently on the file. Use this when a missing diagnostic is
+ * meaningful on its own (e.g. proving that a caption-length warning is
+ * *not* being surfaced) — you want to see what WAS caught, not just "null".
+ */
+async function findOrDump(file, predicate, label) {
+  try {
+    return await waitFor(
+      async () => {
+        const res = await bridge.callTool("al_get_diagnostics", { file, waitForFresh: true });
+        return (res.parsed?.diagnostics ?? []).find(predicate) ?? null;
+      },
+      { timeoutMs: 60_000, intervalMs: 1000, label },
+    );
+  } catch (err) {
+    const res = await bridge.callTool("al_get_diagnostics", { file, waitForFresh: false });
+    const diags = res.parsed?.diagnostics ?? [];
+    const lines = diags.map((d) => `    [${d.severity}] ${d.code} — ${String(d.message).split("\n")[0]}`);
+    const dump = lines.length ? lines.join("\n") : "    (no diagnostics on file)";
+    throw new Error(`${err.message}\n  Diagnostics currently on file:\n${dump}`);
+  }
 }

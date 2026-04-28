@@ -1,0 +1,283 @@
+=====BEGIN Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions.McpSessionManager=====
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions;
+
+internal sealed class McpSessionManager : IMcpSessionManager
+{
+	private readonly ConcurrentDictionary<string, string> sessions = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+
+	private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> serverIndex = new ConcurrentDictionary<string, ConcurrentDictionary<string, byte>>(StringComparer.Ordinal);
+
+	public string CreateSession(string mcpProxyServerName)
+	{
+		if (string.IsNullOrWhiteSpace(mcpProxyServerName))
+		{
+			throw new ArgumentException("MCP proxy server name cannot be null or empty.", "mcpProxyServerName");
+		}
+		string text = Guid.NewGuid().ToString("N");
+		if (!sessions.TryAdd(text, mcpProxyServerName))
+		{
+			throw new InvalidOperationException("Failed to create MCP session with ID: " + text);
+		}
+		serverIndex.GetOrAdd(mcpProxyServerName, (string _) => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal)).TryAdd(text, 0);
+		return text;
+	}
+
+	public bool TryGetServerName(string sessionId, out string mcpProxyServerName)
+	{
+		return sessions.TryGetValue(sessionId, out mcpProxyServerName);
+	}
+
+	public bool SessionExists(string sessionId)
+	{
+		return sessions.ContainsKey(sessionId);
+	}
+
+	public bool RemoveSession(string sessionId)
+	{
+		if (!sessions.TryRemove(sessionId, out string value))
+		{
+			return false;
+		}
+		if (serverIndex.TryGetValue(value, out ConcurrentDictionary<string, byte> value2))
+		{
+			value2.TryRemove(sessionId, out var _);
+			if (value2.IsEmpty)
+			{
+				serverIndex.TryRemove(value, out ConcurrentDictionary<string, byte> _);
+			}
+		}
+		return true;
+	}
+
+	public IReadOnlyCollection<string> GetSessionsForServer(string mcpProxyServerName)
+	{
+		if (!serverIndex.TryGetValue(mcpProxyServerName, out ConcurrentDictionary<string, byte> value))
+		{
+			return (IReadOnlyCollection<string>)(object)Array.Empty<string>();
+		}
+		return value.Keys.ToList();
+	}
+
+	public int RemoveAllSessionsForServer(string mcpProxyServerName)
+	{
+		if (!serverIndex.TryRemove(mcpProxyServerName, out ConcurrentDictionary<string, byte> value))
+		{
+			return 0;
+		}
+		int num = 0;
+		foreach (string key in value.Keys)
+		{
+			if (sessions.TryRemove(key, out string _))
+			{
+				num++;
+			}
+		}
+		return num;
+	}
+}
+=====END Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions.McpSessionManager=====
+=====BEGIN Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions.McpInvokeToolRequestHandler=====
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Dynamics.Nav.EditorServices.Protocol.MessageProtocol;
+using Microsoft.Dynamics.Nav.EditorServices.Protocol.MessageProtocol.DebugAdapterContract;
+using Microsoft.Dynamics.Nav.EditorServices.Protocol.MessageProtocol.LanguageServerContract.Extensions;
+using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
+
+namespace Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions;
+
+internal sealed class McpInvokeToolRequestHandler : McpRequestHandlerBase<McpInvokeToolRequest, InitializeDebugAdapterRequest>
+{
+	public override string EndpointName => "al/mcp/invokeTool";
+
+	public McpInvokeToolRequestHandler(VsCodeWorkspace workspace, ResponseQueue responseQueue, IMcpSessionManager sessionManager)
+		: base(workspace, responseQueue, sessionManager)
+	{
+	}
+
+	protected override async Task ProcessRequestAsync(McpInvokeToolRequest request, int requestId, CancellationToken cancellationToken)
+	{
+		if (request == null)
+		{
+			AddInvalidRequestError("Request payload is null.", requestId, cancellationToken);
+			return;
+		}
+		if (string.IsNullOrEmpty(request.SessionId))
+		{
+			AddInvalidParamsError("sessionId is required.", requestId, cancellationToken);
+			return;
+		}
+		if (!TryGetServerNameForSession(request.SessionId, out string serverName))
+		{
+			AddMethodNotFoundError("Session not found: " + request.SessionId, requestId, cancellationToken);
+			return;
+		}
+		McpClient mcpClient = null;
+		try
+		{
+			mcpClient = await GetOrCreateMcpClient(serverName, request.Configuration, requestId, cancellationToken);
+			if (mcpClient == null)
+			{
+				AddInvalidRequestError("No MCP client found that can execute a start session request.", requestId, cancellationToken);
+				return;
+			}
+			CallToolResult callToolResult = await mcpClient.CallToolAsync(request.Name, request.Arguments?.AsReadOnly() ?? ImmutableDictionary<string, object>.Empty.AsReadOnly(), null, null, cancellationToken);
+			McpInvokeToolResult result = new McpInvokeToolResult
+			{
+				Content = (from TextContentBlock tc in callToolResult.Content.Where((ContentBlock c) => c is TextContentBlock)
+					select new McpContent
+					{
+						Text = tc.Text,
+						Type = tc.Type
+					}).ToList(),
+				IsError = callToolResult.IsError
+			};
+			base.ResponseQueue.Add(ResponseFactory.McpResponse(result, EndpointName, requestId), cancellationToken);
+		}
+		finally
+		{
+			if (mcpClient != null)
+			{
+				await mcpClient.DisposeAsync().ConfigureAwait(continueOnCapturedContext: false);
+			}
+		}
+	}
+}
+=====END Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions.McpInvokeToolRequestHandler=====
+=====BEGIN Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions.McpStartSessionRequestHandler=====
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using System.Text.Json.Serialization;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Dynamics.Nav.EditorServices.Protocol.MessageProtocol;
+using Microsoft.Dynamics.Nav.EditorServices.Protocol.MessageProtocol.DebugAdapterContract;
+using Microsoft.Dynamics.Nav.EditorServices.Protocol.MessageProtocol.LanguageServerContract.Extensions;
+using ModelContextProtocol.Client;
+using ModelContextProtocol.Protocol;
+
+namespace Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions;
+
+internal sealed class McpStartSessionRequestHandler : McpRequestHandlerBase<McpStartSessionRequest, InitializeDebugAdapterRequest>
+{
+	private const string DefaultServerName = "Business Central Troubleshooting MCP Server";
+
+	private const string DefaultProtocolVersion = "2025-06-18";
+
+	private const string DefaultServerVersion = "1.0.0";
+
+	public override string EndpointName => "al/mcp/startSession";
+
+	public McpStartSessionRequestHandler(VsCodeWorkspace workspace, ResponseQueue responseQueue, IMcpSessionManager sessionManager)
+		: base(workspace, responseQueue, sessionManager)
+	{
+	}
+
+	protected override async Task ProcessRequestAsync(McpStartSessionRequest request, int requestId, CancellationToken cancellationToken)
+	{
+		if (request == null)
+		{
+			AddInvalidRequestError("Request payload is null.", requestId, cancellationToken);
+			return;
+		}
+		try
+		{
+			string serverName = request.InitializeParams?.McpProxyServerName ?? "Business Central Troubleshooting MCP Server";
+			string protocolVersion = request.InitializeParams?.ProtocolVersion ?? "2025-06-18";
+			string sessionId = base.SessionManager.CreateSession(serverName);
+			base.Logger.Info($"Started MCP session '{sessionId}' for server '{serverName}'.");
+			McpClient mcpClient = null;
+			try
+			{
+				mcpClient = await GetOrCreateMcpClient(serverName, request.Configuration, requestId, cancellationToken);
+				if (mcpClient == null)
+				{
+					AddInvalidRequestError("No MCP client found that can execute a start session request.", requestId, cancellationToken);
+					return;
+				}
+				Dictionary<string, object> capabilities = CreateCapabilitiesDictionary(mcpClient.ServerCapabilities);
+				McpStartSessionResult result = new McpStartSessionResult
+				{
+					SessionId = sessionId,
+					ProtocolVersion = (mcpClient.NegotiatedProtocolVersion ?? protocolVersion),
+					Capabilities = capabilities,
+					ServerInfo = new McpServerInfo
+					{
+						Name = (mcpClient.ServerInfo?.Name ?? serverName),
+						Version = (mcpClient.ServerInfo?.Version ?? "1.0.0")
+					}
+				};
+				base.ResponseQueue.Add(ResponseFactory.McpResponse(result, EndpointName, requestId), cancellationToken);
+			}
+			finally
+			{
+				if (mcpClient != null)
+				{
+					await mcpClient.DisposeAsync().ConfigureAwait(continueOnCapturedContext: false);
+				}
+			}
+		}
+		catch (Exception ex)
+		{
+			AddInternalError("Start session failed: " + ex.Message, requestId, cancellationToken);
+		}
+	}
+
+	private static Dictionary<string, object> CreateCapabilitiesDictionary(ServerCapabilities? serverCapabilities)
+	{
+		Dictionary<string, object> dictionary = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+		if (serverCapabilities == null)
+		{
+			return dictionary;
+		}
+		Type type = serverCapabilities.GetType();
+		Type typeFromHandle = typeof(JsonPropertyNameAttribute);
+		PropertyInfo[] properties = type.GetProperties(BindingFlags.Instance | BindingFlags.Public);
+		foreach (PropertyInfo propertyInfo in properties)
+		{
+			if (!propertyInfo.CanRead)
+			{
+				continue;
+			}
+			object[] customAttributes = propertyInfo.GetCustomAttributes(typeFromHandle, inherit: false);
+			if (customAttributes != null && customAttributes.Length != 0)
+			{
+				JsonPropertyNameAttribute jsonPropertyNameAttribute = (JsonPropertyNameAttribute)customAttributes[0];
+				object value;
+				try
+				{
+					value = propertyInfo.GetValue(serverCapabilities);
+				}
+				catch
+				{
+					continue;
+				}
+				if (value != null)
+				{
+					string key = (string.IsNullOrWhiteSpace(jsonPropertyNameAttribute.Name) ? propertyInfo.Name : jsonPropertyNameAttribute.Name);
+					dictionary[key] = value;
+				}
+			}
+		}
+		return dictionary;
+	}
+}
+=====END Microsoft.Dynamics.Nav.EditorServices.Protocol.LanguageServer.Extensions.McpStartSessionRequestHandler=====
+=====BEGIN Microsoft.Dynamics.Nav.EditorServices.Protocol.RadPackageModuleOutputter=====
+System.InvalidOperationException: Could not find type definition Microsoft.Dynamics.Nav.EditorServices.Protocol.RadPackageModuleOutputter in type system.
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DecompileType(FullTypeName fullTypeName) in /_/ICSharpCode.Decompiler/CSharp/CSharpDecompiler.cs:line 977
+   at ICSharpCode.Decompiler.CSharp.CSharpDecompiler.DecompileTypeAsString(FullTypeName fullTypeName) in /_/ICSharpCode.Decompiler/CSharp/CSharpDecompiler.cs:line 997
+   at ICSharpCode.ILSpyCmd.ILSpyCmdProgram.Decompile(String assemblyFileName, TextWriter output, String typeName) in D:\a\ILSpy\ILSpy\ICSharpCode.ILSpyCmd\IlspyCmdProgram.cs:line 333
+   at ICSharpCode.ILSpyCmd.ILSpyCmdProgram.<OnExecuteAsync>g__PerformPerFileAction|53_0(String fileName, <>c__DisplayClass53_0& ) in D:\a\ILSpy\ILSpy\ICSharpCode.ILSpyCmd\IlspyCmdProgram.cs:line 245
+   at ICSharpCode.ILSpyCmd.ILSpyCmdProgram.OnExecuteAsync(CommandLineApplication app) in D:\a\ILSpy\ILSpy\ICSharpCode.ILSpyCmd\IlspyCmdProgram.cs:line 166
+=====END Microsoft.Dynamics.Nav.EditorServices.Protocol.RadPackageModuleOutputter=====

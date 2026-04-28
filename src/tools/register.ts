@@ -20,6 +20,9 @@ import {
   createRunCodeAction,
   listCodeActions,
 } from "./codeActions.js";
+import { RunTestsInput, createRunTests } from "./runTests.js";
+import { CompileInput, createCompile } from "./compile.js";
+import { PublishInput, createPublish } from "./publish.js";
 
 export function registerTools(
   mcp: McpServer,
@@ -30,6 +33,9 @@ export function registerTools(
   const applyEdit = createApplyEdit(client, config);
   const getDiagnostics = createGetDiagnostics(client, config);
   const runCodeAction = createRunCodeAction(client, config);
+  const runTests = createRunTests(config.workspaceRoot);
+  const compile = createCompile(config);
+  const publish = createPublish(config.workspaceRoot);
 
   const json = (v: unknown) => ({
     content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }],
@@ -183,6 +189,53 @@ export function registerTools(
     async (input) => {
       await lspReady;
       return json(await runCodeAction(input));
+    },
+  );
+
+  mcp.registerTool(
+    "al_run_tests",
+    {
+      description:
+        "Run an AL test codeunit against a Business Central on-premise dev service tier. " +
+        "Reads connection info from the project's .vscode/launch.json. " +
+        "Credentials come from BC_USER/BC_PASSWORD env vars, or ~/.config/al-mcp-bridge/credentials.json " +
+        "(mode 0600 required). Returns per-method pass/fail/skipped results. " +
+        "Linux-compatible — does not use the Windows Credential Manager path Microsoft's tool requires.",
+      inputSchema: RunTestsInput.shape,
+    },
+    async (input) => {
+      // No lspReady wait — this tool talks to BC directly, not the LSP.
+      return json(await runTests(input));
+    },
+  );
+
+  mcp.registerTool(
+    "al_compile",
+    {
+      description:
+        "Compile an AL project to a .app package by invoking the `alc` binary that ships with the AL extension. " +
+        "Returns exit code, parsed SARIF diagnostics (with file/line ranges), and the produced .app path. " +
+        "Defaults for analyzers, package cache, and ruleset come from the bridge's resolved config (same as the LSP), " +
+        "but can be overridden per call. Runs on Linux — does not depend on the MS `al-mcp` server.",
+      inputSchema: CompileInput.shape,
+    },
+    async (input) => {
+      return json(await compile(input));
+    },
+  );
+
+  mcp.registerTool(
+    "al_publish",
+    {
+      description:
+        "Publish a compiled .app to a Business Central on-premise dev service tier. " +
+        "Reads server/instance/tenant from .vscode/launch.json and reuses the same BC_USER/BC_PASSWORD " +
+        "credential flow as al_run_tests. Uploads via multipart/form-data POST to /<instance>/dev/apps. " +
+        "Scope: on-prem + UserPassword auth only. Run al_compile first to produce the .app.",
+      inputSchema: PublishInput.shape,
+    },
+    async (input) => {
+      return json(await publish(input));
     },
   );
 

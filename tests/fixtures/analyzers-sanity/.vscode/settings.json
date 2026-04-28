@@ -6,7 +6,8 @@
     "${analyzerFolder}Microsoft.Dynamics.Nav.AppSourceCop.dll",
     "${analyzerFolder}Microsoft.Dynamics.Nav.UICop.dll",
     "${analyzerFolder}Microsoft.Dynamics.Nav.PerTenantExtensionCop.dll",
-    "${analyzerFolder}ALCops.LinterCop.dll"
+    "${analyzerFolder}ALCops.LinterCop.dll",
+    "${analyzerFolder}ALCops.ApplicationCop.dll"
   ],
   "al.enableCodeAnalysis": true,
   "al.enableCodeActions": true,

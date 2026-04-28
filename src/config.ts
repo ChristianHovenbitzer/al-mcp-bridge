@@ -218,12 +218,10 @@ export function loadConfig(): BridgeConfig {
 
   const ruleSetPath = resolveEffectiveRuleSetPath(settings, ctx);
 
-  const settingsProbingPaths = (readStringArray(settings, "al.assemblyProbingPaths") ?? [])
+  const assemblyProbingPaths = (readStringArray(settings, "al.assemblyProbingPaths") ?? [])
     .map((p) => resolvePlaceholders(p, ctx))
     .map((p) => (isAbsolute(p) ? p : resolve(workspaceRoot, p)))
     .filter((p) => existsSync(p));
-  const analyzerDirs = uniqueDirs(codeAnalyzers);
-  const assemblyProbingPaths = dedupe([...settingsProbingPaths, ...analyzerDirs]);
 
   const packageCachePaths = (process.env.AL_PACKAGE_CACHE ?? "")
     .split(";")
@@ -425,8 +423,8 @@ const ANALYZER_SIBLING_RULES: AnalyzerSiblingRule[] = [
 ];
 
 function augmentWithAnalyzerSiblings(codeAnalyzers: string[]): string[] {
-  const out = [...codeAnalyzers];
-  const seen = new Set(out.map((p) => p.toLowerCase()));
+  const seen = new Set(codeAnalyzers.map((p) => p.toLowerCase()));
+  const siblings: string[] = [];
   for (const analyzer of codeAnalyzers) {
     const name = basename(analyzer).toLowerCase();
     const dir = dirname(analyzer);
@@ -438,11 +436,15 @@ function augmentWithAnalyzerSiblings(codeAnalyzers: string[]): string[] {
         if (seen.has(key)) continue;
         if (!existsSync(p)) continue;
         seen.add(key);
-        out.push(p);
+        siblings.push(p);
       }
     }
   }
-  return out;
+  // Prepend siblings so they are loaded before the analyzers that depend on
+  // them. When alc (or the language server) uses a shared AssemblyLoadContext
+  // for all /analyzer: entries, loading the common helper DLLs first ensures
+  // they are already in the ALC when the main analyzer types are instantiated.
+  return [...siblings, ...codeAnalyzers];
 }
 
 /**
@@ -523,28 +525,3 @@ function parseSemicolonList(v: string | undefined): string[] {
   return v.split(";").map((s) => s.trim()).filter(Boolean);
 }
 
-function uniqueDirs(filePaths: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const p of filePaths) {
-    const d = dirname(p);
-    if (!d) continue;
-    const key = d.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(d);
-  }
-  return out;
-}
-
-function dedupe(paths: string[]): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const p of paths) {
-    const key = p.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(p);
-  }
-  return out;
-}

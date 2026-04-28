@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <AssemblyName>Microsoft.Dynamics.Nav.Deployment</AssemblyName>
+    <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
+    <OutputType>Library</OutputType>
+    <TargetFramework>netcoreapp8.0</TargetFramework>
+  </PropertyGroup>
+  <PropertyGroup>
+    <LangVersion>11.0</LangVersion>
+    <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup>
+    <RootNamespace />
+  </PropertyGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Newtonsoft.Json.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.ApplicationInsights">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.ApplicationInsights.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Dynamics.Nav.CodeAnalysis">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.Dynamics.Nav.CodeAnalysis.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Identity.Client">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.Identity.Client.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Identity.Client.Extensions.Msal">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.Identity.Client.Extensions.Msal.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.IdentityModel.JsonWebTokens">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.IdentityModel.JsonWebTokens.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.IdentityModel.Tokens">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.IdentityModel.Tokens.dll</HintPath>
+    </Reference>
+    <Reference Include="ModelContextProtocol.Core">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\ModelContextProtocol.Core.dll</HintPath>
+    </Reference>
+    <Reference Include="Microsoft.Dynamics.Nav.TypeWrappers">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\Microsoft.Dynamics.Nav.TypeWrappers.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Security.Cryptography.ProtectedData">
+      <HintPath>..\..\..\..\.vscode\extensions\ms-dynamics-smb.al-17.0.2273547\bin\win32\System.Security.Cryptography.ProtectedData.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>
