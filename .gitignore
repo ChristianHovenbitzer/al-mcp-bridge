@@ -19,4 +19,3 @@ tests/.al-ls/
 # blanket .vscode/ ignore above.
 !tests/fixtures/**/.vscode/
 !tests/fixtures/**/.vscode/**
-src/tools/compile.ts
