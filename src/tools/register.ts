@@ -23,6 +23,14 @@ import {
 import { RunTestsInput, createRunTests } from "./runTests.js";
 import { CompileInput, createCompile } from "./compile.js";
 import { PublishInput, createPublish } from "./publish.js";
+import {
+  ListWorkspacesInput,
+  LoadWorkspaceInput,
+  assertFileInWorkspace,
+  createListWorkspaces,
+  createLoadWorkspace,
+} from "./workspace.js";
+import { LspStatusInput, createLspStatus } from "./status.js";
 
 export function registerTools(
   mcp: McpServer,
@@ -36,10 +44,19 @@ export function registerTools(
   const runTests = createRunTests(config.workspaceRoot);
   const compile = createCompile(config);
   const publish = createPublish(config.workspaceRoot);
+  const loadWorkspace = createLoadWorkspace(client, config);
+  const listWorkspaces = createListWorkspaces(client, config);
+  const lspStatus = createLspStatus(client, config);
 
   const json = (v: unknown) => ({
     content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }],
   });
+
+  /** Reject inputs whose `file` path isn't under any loaded workspace.
+   *  Surfaces clearly instead of silently returning empty diagnostics or
+   *  outline data — the bridge's most confusing failure mode. */
+  const guardFile = (input: { file: string }) =>
+    assertFileInWorkspace(input.file, client.getWorkspaceFolders());
 
   mcp.registerTool(
     "al_document_outline",
@@ -50,6 +67,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await documentOutline(client, input));
     },
   );
@@ -63,6 +81,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await symbolAt(client, input));
     },
   );
@@ -76,6 +95,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await findReferences(client, input));
     },
   );
@@ -89,6 +109,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await rename(client, input));
     },
   );
@@ -102,6 +123,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await formatDocument(client, input));
     },
   );
@@ -115,6 +137,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await applyEdit(input));
     },
   );
@@ -128,6 +151,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await getDiagnostics(input));
     },
   );
@@ -173,6 +197,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      guardFile(input);
       return json(await listCodeActions(client, input));
     },
   );
@@ -188,6 +213,7 @@ export function registerTools(
     },
     async (input) => {
       await lspReady;
+      assertFileInWorkspace(input.action.fileName, client.getWorkspaceFolders());
       return json(await runCodeAction(input));
     },
   );
@@ -236,6 +262,59 @@ export function registerTools(
     },
     async (input) => {
       return json(await publish(input));
+    },
+  );
+
+  mcp.registerTool(
+    "al_load_workspace",
+    {
+      description:
+        "Register an additional AL project folder with the running LSP at runtime. " +
+        "Use this when al_get_diagnostics / al_document_outline / etc. fail with " +
+        "\"file is not inside any loaded AL workspace\" — typically because the bridge " +
+        "was launched from a directory that doesn't share an `app.json` ancestor with the file. " +
+        "The path must be the AL project root (the folder containing `app.json`). " +
+        "Re-reads that folder's `.vscode/settings.json` so its analyzers and ruleset apply " +
+        "to its own files.",
+      inputSchema: LoadWorkspaceInput.shape,
+    },
+    async (input) => {
+      await lspReady;
+      return json(await loadWorkspace(input));
+    },
+  );
+
+  mcp.registerTool(
+    "al_list_workspaces",
+    {
+      description:
+        "Return the AL project folders currently registered with the LSP, the primary " +
+        "workspace, and a flag indicating whether the initial set was inferred via a " +
+        "downward filesystem scan (a common cause of the bridge attaching to the wrong project).",
+      inputSchema: ListWorkspacesInput.shape,
+    },
+    async () => {
+      await lspReady;
+      return json(await listWorkspaces());
+    },
+  );
+
+  mcp.registerTool(
+    "al_lsp_status",
+    {
+      description:
+        "Diagnose why the LSP-driven tools (al_get_diagnostics, al_list_code_actions, …) " +
+        "return less than expected. Returns the running LS process info (pid, start time, " +
+        "uptime), every registered workspace with its resolved analyzer DLL paths plus on-disk " +
+        "mtime/size, open documents, the push-diagnostics cache snapshot, pull-diagnostics " +
+        "traffic counters, and a `warnings` array calling out common failure modes " +
+        "(stale analyzer DLL, missing ruleset, code-analysis disabled, empty cache with " +
+        "open docs). Use this first whenever VSCode shows a diagnostic the bridge doesn't.",
+      inputSchema: LspStatusInput.shape,
+    },
+    async (input) => {
+      await lspReady;
+      return json(await lspStatus(input));
     },
   );
 

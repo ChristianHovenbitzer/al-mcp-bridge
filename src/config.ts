@@ -3,15 +3,15 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 
-export interface BridgeConfig {
-  /** Absolute path to the AL language server executable / DLL. */
-  languageServerPath: string;
-  /** Primary workspace root the LSP is initialized against (first entry of `workspaceFolders`). */
+/**
+ * Per-workspace configuration that gets forwarded to the AL LS via
+ * `al/setActiveWorkspace`. Resolved from each workspace's own
+ * `.vscode/settings.json` so a multi-workspace bridge can honor
+ * project-specific analyzer/ruleset choices.
+ */
+export interface AlWorkspaceSettings {
+  /** Absolute workspace root path (folder containing `app.json`). */
   workspaceRoot: string;
-  /** All discovered AL project folders (each contains an `app.json`). */
-  workspaceFolders: string[];
-  /** Optional package cache paths forwarded to the LSP. */
-  packageCachePaths: string[];
   /**
    * Merged probing paths handed to `al/setActiveWorkspace`: user-provided
    * `al.assemblyProbingPaths` from `.vscode/settings.json` plus every parent
@@ -29,8 +29,6 @@ export interface BridgeConfig {
   enableCodeAnalysis: boolean;
   /** Mirrors `al.enableCodeActions`. */
   enableCodeActions: boolean;
-  /** Milliseconds to wait for `publishDiagnostics` to settle after an edit. */
-  diagnosticsSettleMs: number;
   /**
    * Mirrors `al.backgroundCodeAnalysis`: "None" | "File" | "Project" | true | false.
    * Forwarded verbatim to `al/setActiveWorkspace`. Without this, the AL LS
@@ -42,42 +40,162 @@ export interface BridgeConfig {
   ruleSetPath?: string;
 }
 
+export interface BridgeConfig {
+  /** Absolute path to the AL language server executable / DLL. */
+  languageServerPath: string;
+  /** Primary workspace root the LSP is initialized against (first entry of `workspaceFolders`). */
+  workspaceRoot: string;
+  /** All discovered AL project folders (each contains an `app.json`). */
+  workspaceFolders: string[];
+  /** Optional package cache paths forwarded to the LSP. */
+  packageCachePaths: string[];
+  /** Per-workspace resolved settings, keyed by absolute workspace root. */
+  workspaceSettings: Map<string, AlWorkspaceSettings>;
+  /** Whether the active set of workspaces was inferred via a downward scan
+   *  (true) or anchored on an upward `app.json` walk / explicit `AL_WORKSPACE`
+   *  (false). Useful for emitting startup warnings: a downward fallback
+   *  often means the bridge picked up the wrong project. */
+  resolvedViaDownwardScan: boolean;
+  /** Milliseconds to wait for `publishDiagnostics` to settle after an edit. */
+  diagnosticsSettleMs: number;
+  // ---- legacy mirrors of the primary workspace's settings, kept for
+  // ---- backwards-compat with tools that read directly off the config.
+  // ---- New code should consult `workspaceSettings.get(workspaceRoot)`.
+  assemblyProbingPaths: string[];
+  codeAnalyzers: string[];
+  enableCodeAnalysis: boolean;
+  enableCodeActions: boolean;
+  backgroundCodeAnalysis: string | boolean;
+  ruleSetPath?: string;
+}
+
+/**
+ * Default roots under which the AL VS Code extension may be installed. The
+ * extension auto-updates in place, so the bridge must rediscover the binary
+ * by version rather than pin a path — a hardcoded path breaks the moment the
+ * extension updates and the old `ms-dynamics-smb.al-<version>` folder is
+ * deleted.
+ *
+ * `.vscode-server` is where Remote-SSH / dev-container / WSL / Codespaces
+ * installs land (and is the only root present on headless boxes), so it must
+ * be searched alongside the desktop `~/.vscode` location.
+ */
+function defaultExtensionRoots(): string[] {
+  const home = homedir();
+  return [
+    join(home, ".vscode-server", "extensions"),
+    join(home, ".vscode-server-insiders", "extensions"),
+    join(home, ".vscode", "extensions"),
+    join(home, ".vscode-insiders", "extensions"),
+  ];
+}
+
+/** Compare two `ms-dynamics-smb.al-<version>` dir names by numeric version
+ *  (descending), so 18.0 beats 9.x — which a plain string sort gets wrong. */
+function compareExtensionDirsDesc(a: string, b: string): number {
+  const ver = (name: string): number[] => {
+    const m = /ms-dynamics-smb\.al-(.+)$/.exec(name);
+    return m ? m[1]!.split(".").map((n) => Number.parseInt(n, 10) || 0) : [];
+  };
+  const va = ver(a);
+  const vb = ver(b);
+  const len = Math.max(va.length, vb.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (vb[i] ?? 0) - (va[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return b.localeCompare(a);
+}
+
+/**
+ * Candidate entry-point paths (relative to an extension folder) ordered so
+ * the CURRENT platform's binary wins. The AL extension is cross-platform and
+ * ships every OS's host under `bin/<platform>/`, so on Linux the `win32`
+ * `.exe` is present but not executable — picking it yields a spawn EACCES.
+ * Always try the running platform's native binary first.
+ */
+function entryNamesForPlatform(platform: NodeJS.Platform): string[] {
+  const native = "Microsoft.Dynamics.Nav.EditorServices.Host";
+  const byPlatform: Record<string, string[]> = {
+    win32: [`bin/win32/${native}.exe`, `bin/${native}.exe`],
+    linux: [`bin/linux/${native}`, `bin/${native}`],
+    darwin: [`bin/darwin/${native}`, `bin/${native}`],
+  };
+  const preferred = byPlatform[platform] ?? [];
+  // Fall back to every other platform's entry so a misreported platform or
+  // an unusual package layout still resolves *something* rather than null.
+  const rest = [
+    `bin/${native}.exe`,
+    `bin/win32/${native}.exe`,
+    `bin/${native}`,
+    `bin/linux/${native}`,
+    `bin/darwin/${native}`,
+  ].filter((e) => !preferred.includes(e));
+  return [...preferred, ...rest];
+}
+
 /**
  * Locate the AL language server binary inside the installed VS Code
  * extension. Returns the newest matching install or null if none found.
  *
  * The AL extension host binary lives under
- *   ~/.vscode/extensions/ms-dynamics-smb.al-<version>/bin/
- * The actual entry point varies by platform and extension version — the
- * caller is expected to override this via AL_LS_PATH when autodetect
- * guesses wrong.
+ *   <root>/ms-dynamics-smb.al-<version>/bin/[<platform>/]Microsoft.Dynamics.Nav.EditorServices.Host[.exe]
+ * Versions are compared numerically and the newest is preferred; `AL_LS_PATH`
+ * still overrides this when set (see `resolveLanguageServerPath`).
+ *
+ * @param roots Extension roots to search, newest-version-wins within each in
+ *   listed order. Defaults to the standard desktop + server locations;
+ *   parameterized for testability.
  */
-export function autodetectLanguageServer(): string | null {
-  const extensionsDir = join(homedir(), ".vscode", "extensions");
-  if (!existsSync(extensionsDir)) return null;
+export function autodetectLanguageServer(
+  roots: string[] = defaultExtensionRoots(),
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  const entryNames = entryNamesForPlatform(platform);
 
-  const candidates = readdirSync(extensionsDir)
-    .filter((d) => d.startsWith("ms-dynamics-smb.al-"))
-    .map((d) => join(extensionsDir, d))
-    .filter((p) => statSync(p).isDirectory())
-    .sort()
-    .reverse();
+  for (const extensionsDir of roots) {
+    if (!existsSync(extensionsDir)) continue;
 
-  const entryNames = [
-    "bin/Microsoft.Dynamics.Nav.EditorServices.Host.exe",
-    "bin/win32/Microsoft.Dynamics.Nav.EditorServices.Host.exe",
-    "bin/Microsoft.Dynamics.Nav.EditorServices.Host",
-    "bin/linux/Microsoft.Dynamics.Nav.EditorServices.Host",
-    "bin/darwin/Microsoft.Dynamics.Nav.EditorServices.Host",
-  ];
+    const candidates = readdirSync(extensionsDir)
+      .filter((d) => d.startsWith("ms-dynamics-smb.al-"))
+      .filter((d) => {
+        try {
+          return statSync(join(extensionsDir, d)).isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .sort(compareExtensionDirsDesc)
+      .map((d) => join(extensionsDir, d));
 
-  for (const ext of candidates) {
-    for (const entry of entryNames) {
-      const p = join(ext, entry);
-      if (existsSync(p)) return p;
+    for (const ext of candidates) {
+      for (const entry of entryNames) {
+        const p = join(ext, entry);
+        if (existsSync(p)) return p;
+      }
     }
   }
   return null;
+}
+
+/**
+ * Resolve the AL language server path, preferring an explicit `AL_LS_PATH`
+ * but self-healing when it is stale. An extension update deletes the old
+ * version folder, so a previously-correct `AL_LS_PATH` can point at a binary
+ * that no longer exists; rather than hand that dead path to `spawn` (which
+ * fails ENOENT and takes the whole bridge down), fall back to autodetection.
+ */
+export function resolveLanguageServerPath(): string | null {
+  const fromEnv = process.env.AL_LS_PATH?.trim();
+  if (fromEnv) {
+    if (existsSync(fromEnv)) return fromEnv;
+    process.stderr.write(
+      `[al-mcp-bridge] AL_LS_PATH points to a missing file (likely a stale ` +
+        `extension version after an update): ${fromEnv}\n` +
+        `[al-mcp-bridge] falling back to autodetecting the installed AL extension.\n`,
+    );
+  }
+  return autodetectLanguageServer();
 }
 
 /**
@@ -148,6 +266,15 @@ function findAlProjectsDownward(start: string, maxDepth = 4): string[] {
   return results;
 }
 
+export interface DiscoverResult {
+  folders: string[];
+  /** True when no upward `app.json` was found and we fell back to scanning
+   *  down from cwd. The caller may want to warn — downward fallback often
+   *  catches an unintended project when the bridge launches from a tool
+   *  repo (e.g. al-mcp-bridge itself, finding tests/fixtures). */
+  viaDownwardScan: boolean;
+}
+
 /**
  * Resolve which AL project folders this bridge should serve.
  *
@@ -156,22 +283,94 @@ function findAlProjectsDownward(start: string, maxDepth = 4): string[] {
  *   2. Nearest `app.json` walking upward from cwd (single-project case)
  *   3. All `app.json` folders discovered by scanning subfolders of cwd (monorepo case)
  */
-export function discoverAlWorkspaces(start: string): string[] {
+export function discoverAlWorkspaces(start: string): DiscoverResult {
   const upward = findAlProjectUpward(start);
-  if (upward) return [upward];
-  return findAlProjectsDownward(start);
+  if (upward) return { folders: [upward], viaDownwardScan: false };
+  return { folders: findAlProjectsDownward(start), viaDownwardScan: true };
+}
+
+/**
+ * Resolve per-workspace settings: re-read this workspace's
+ * `.vscode/settings.json` and expand placeholders against its own root, so
+ * analyzer paths / rulesets follow the project rather than the bridge's
+ * primary workspace.
+ */
+export function resolveWorkspaceSettings(
+  workspaceRoot: string,
+  lsPath: string,
+): AlWorkspaceSettings {
+  const settings = readWorkspaceSettings(workspaceRoot);
+  const analyzerFolder = deriveAnalyzerFolder(lsPath);
+  const ctx: PlaceholderCtx = {
+    analyzerFolder,
+    workspaceFolder: workspaceRoot,
+    alWorkspaceFolder: workspaceRoot,
+  };
+
+  const enableCodeAnalysis = readBool(settings, "al.enableCodeAnalysis") ?? true;
+  const enableCodeActions = readBool(settings, "al.enableCodeActions") ?? true;
+
+  // AL_EXTRA_CODE_ANALYZERS is documented as "active regardless of what each
+  // project's settings.json says" — i.e. team-wide enforcement that no
+  // workspace can opt out of. Resolve it independently of the master switch
+  // so a workspace with `al.enableCodeAnalysis: false` still gets the extras,
+  // and force-enable the pipeline in that case (otherwise the LS won't
+  // schedule analyzer runs and the DLLs sit inert).
+  const fromSettings = readStringArray(settings, "al.codeAnalyzers") ?? [];
+  const fromEnv = parseDelimitedList(process.env.AL_EXTRA_CODE_ANALYZERS);
+  let codeAnalyzers: string[] = [];
+  let effectiveEnableCodeAnalysis = enableCodeAnalysis;
+  if (enableCodeAnalysis) {
+    codeAnalyzers = resolveCodeAnalyzers([...fromSettings, ...fromEnv], ctx);
+  } else if (fromEnv.length > 0) {
+    // Workspace disabled analysis, but team policy via env wins: load only
+    // the env extras (NOT the workspace's `al.codeAnalyzers` — those were
+    // explicitly disabled) and turn the master switch back on.
+    codeAnalyzers = resolveCodeAnalyzers(fromEnv, ctx);
+    if (codeAnalyzers.length > 0) {
+      effectiveEnableCodeAnalysis = true;
+      process.stderr.write(
+        `[al-mcp-bridge] ${workspaceRoot}: forcing al.enableCodeAnalysis=true ` +
+          `because AL_EXTRA_CODE_ANALYZERS provides ${codeAnalyzers.length} ` +
+          `analyzer(s) and the workspace had analysis disabled.\n`,
+      );
+    }
+  }
+  if (codeAnalyzers.length > 0) {
+    codeAnalyzers = augmentWithAnalyzerSiblings(codeAnalyzers);
+  }
+
+  const backgroundCodeAnalysis =
+    readString(settings, "al.backgroundCodeAnalysis") ?? "File";
+  const ruleSetPath = resolveEffectiveRuleSetPath(settings, ctx);
+  const assemblyProbingPaths = (readStringArray(settings, "al.assemblyProbingPaths") ?? [])
+    .map((p) => resolvePlaceholders(p, ctx))
+    .map((p) => (isAbsolute(p) ? p : resolve(workspaceRoot, p)))
+    .filter((p) => existsSync(p));
+
+  return {
+    workspaceRoot,
+    assemblyProbingPaths,
+    codeAnalyzers,
+    enableCodeAnalysis: effectiveEnableCodeAnalysis,
+    enableCodeActions,
+    backgroundCodeAnalysis,
+    ruleSetPath,
+  };
 }
 
 export function loadConfig(): BridgeConfig {
-  const lsPath = process.env.AL_LS_PATH ?? autodetectLanguageServer();
+  const lsPath = resolveLanguageServerPath();
   if (!lsPath) {
     throw new Error(
-      "Could not locate the AL language server. Set AL_LS_PATH to the " +
-        "absolute path of Microsoft.Dynamics.Nav.EditorServices.Host(.exe).",
+      "Could not locate the AL language server. Install the AL VS Code " +
+        "extension, or set AL_LS_PATH to the absolute path of " +
+        "Microsoft.Dynamics.Nav.EditorServices.Host(.exe).",
     );
   }
 
   let workspaceFolders: string[];
+  let resolvedViaDownwardScan = false;
   if (process.env.AL_WORKSPACE) {
     workspaceFolders = process.env.AL_WORKSPACE.split(";")
       .map((s) => s.trim())
@@ -184,7 +383,9 @@ export function loadConfig(): BridgeConfig {
     }
   } else {
     const cwd = process.cwd();
-    workspaceFolders = discoverAlWorkspaces(cwd);
+    const discovered = discoverAlWorkspaces(cwd);
+    workspaceFolders = discovered.folders;
+    resolvedViaDownwardScan = discovered.viaDownwardScan;
     if (workspaceFolders.length === 0) {
       throw new Error(
         `No AL project (app.json) found at, above, or under ${cwd}. ` +
@@ -194,34 +395,11 @@ export function loadConfig(): BridgeConfig {
   }
 
   const workspaceRoot = workspaceFolders[0]!;
-  const settings = readWorkspaceSettings(workspaceRoot);
-  const analyzerFolder = deriveAnalyzerFolder(lsPath);
-  const ctx: PlaceholderCtx = {
-    analyzerFolder,
-    workspaceFolder: workspaceRoot,
-    alWorkspaceFolder: workspaceRoot,
-  };
-
-  const enableCodeAnalysis = readBool(settings, "al.enableCodeAnalysis") ?? true;
-  const enableCodeActions = readBool(settings, "al.enableCodeActions") ?? true;
-
-  let codeAnalyzers: string[] = [];
-  if (enableCodeAnalysis) {
-    const fromSettings = readStringArray(settings, "al.codeAnalyzers") ?? [];
-    const fromEnv = parseSemicolonList(process.env.AL_EXTRA_CODE_ANALYZERS);
-    codeAnalyzers = resolveCodeAnalyzers([...fromSettings, ...fromEnv], ctx);
-    codeAnalyzers = augmentWithAnalyzerSiblings(codeAnalyzers);
+  const workspaceSettings = new Map<string, AlWorkspaceSettings>();
+  for (const folder of workspaceFolders) {
+    workspaceSettings.set(folder, resolveWorkspaceSettings(folder, lsPath));
   }
-
-  const backgroundCodeAnalysis =
-    readString(settings, "al.backgroundCodeAnalysis") ?? "File";
-
-  const ruleSetPath = resolveEffectiveRuleSetPath(settings, ctx);
-
-  const assemblyProbingPaths = (readStringArray(settings, "al.assemblyProbingPaths") ?? [])
-    .map((p) => resolvePlaceholders(p, ctx))
-    .map((p) => (isAbsolute(p) ? p : resolve(workspaceRoot, p)))
-    .filter((p) => existsSync(p));
+  const primary = workspaceSettings.get(workspaceRoot)!;
 
   const packageCachePaths = (process.env.AL_PACKAGE_CACHE ?? "")
     .split(";")
@@ -232,14 +410,16 @@ export function loadConfig(): BridgeConfig {
     languageServerPath: lsPath,
     workspaceRoot,
     workspaceFolders,
+    workspaceSettings,
+    resolvedViaDownwardScan,
     packageCachePaths,
-    assemblyProbingPaths,
-    codeAnalyzers,
-    enableCodeAnalysis,
-    enableCodeActions,
+    assemblyProbingPaths: primary.assemblyProbingPaths,
+    codeAnalyzers: primary.codeAnalyzers,
+    enableCodeAnalysis: primary.enableCodeAnalysis,
+    enableCodeActions: primary.enableCodeActions,
     diagnosticsSettleMs: Number(process.env.AL_DIAGNOSTICS_SETTLE_MS ?? 750),
-    backgroundCodeAnalysis,
-    ruleSetPath,
+    backgroundCodeAnalysis: primary.backgroundCodeAnalysis,
+    ruleSetPath: primary.ruleSetPath,
   };
 }
 
@@ -473,7 +653,7 @@ function resolveEffectiveRuleSetPath(
     }
   }
 
-  for (const entry of parseSemicolonList(process.env.AL_EXTRA_RULESETS)) {
+  for (const entry of parseDelimitedList(process.env.AL_EXTRA_RULESETS)) {
     const expanded = resolvePlaceholders(entry, ctx);
     const abs = isAbsolute(expanded) ? expanded : resolve(ctx.workspaceFolder, expanded);
     if (!existsSync(abs)) {
@@ -520,8 +700,15 @@ function writeCompositeRuleSet(paths: string[], workspaceRoot: string): string {
   return file;
 }
 
-function parseSemicolonList(v: string | undefined): string[] {
+/**
+ * Split an env-provided list of paths on `;` (documented) OR `,` (lenient).
+ * Both delimiters appear in the wild — `;` matches Windows PATH conventions
+ * and JSON-array intuition, `,` is what users reach for when typing a list
+ * into a JSON string. Neither delimiter is a valid character in any AL
+ * analyzer DLL filename we ship, so accepting both is safe in practice.
+ */
+function parseDelimitedList(v: string | undefined): string[] {
   if (!v) return [];
-  return v.split(";").map((s) => s.trim()).filter(Boolean);
+  return v.split(/[;,]/).map((s) => s.trim()).filter(Boolean);
 }
 

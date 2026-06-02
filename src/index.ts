@@ -18,6 +18,17 @@ async function main(): Promise<void> {
   for (const f of config.workspaceFolders) {
     process.stderr.write(`[al-mcp-bridge]   - ${f}\n`);
   }
+  if (config.resolvedViaDownwardScan) {
+    // Workspace inferred by scanning subfolders of cwd — usually means the
+    // bridge was launched from a place that doesn't share an `app.json`
+    // ancestor with the AL project the user actually wants. Loud warning so
+    // callers debugging "no diagnostics returned" can spot the misalignment.
+    process.stderr.write(
+      `[al-mcp-bridge] WARNING: no app.json found upward from cwd; the workspace(s) above were ` +
+        `discovered by scanning subfolders. If this isn't your target project, set AL_WORKSPACE ` +
+        `or call the al_load_workspace tool at runtime.\n`,
+    );
+  }
 
   // Kick LSP init in the background so MCP is responsive immediately;
   // tool calls await `lspReady` individually.
