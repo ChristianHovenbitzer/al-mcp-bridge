@@ -31,6 +31,7 @@ console.log(`project:  ${config.workspaceRoot}`);
 const result = await compile({
   generateCode: false, // validation-only; no .app needed for this smoke
   continueOnError: true,
+  verbose: true, // this smoke asserts on per-diagnostic detail (file/line/code)
 });
 
 // The fixture ships without symbols, so expect AL1022 + AL0305 + assorted cop diagnostics.

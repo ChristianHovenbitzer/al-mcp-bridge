@@ -333,13 +333,13 @@ All tools are registered in `src/tools/register.ts`. Inputs are validated with Z
 | Tool | LSP endpoint | Description |
 |---|---|---|
 | `al_list_code_actions` | `textDocument/codeAction` | List available code actions (quickfixes, refactorings) at a position or range. Works with loaded analyzer DLLs — ALCops and LinterCop fixes appear here when configured. Filter by `only` (e.g. `["quickfix"]`). |
-| `al_run_code_action` | `al/runCodeAction` + `workspace/applyEdit` (reverse) | Execute a code action returned by `al_list_code_actions`. The AL LS uses a non-standard reverse-request protocol: the bridge pre-registers a waiter before sending the action, then captures the inbound `workspace/applyEdit`. Returns per-file before/after text plus fresh diagnostics. Set `persist=false` for preview mode. |
+| `al_run_code_action` | `al/runCodeAction` + `workspace/applyEdit` (reverse) | Execute a code action returned by `al_list_code_actions`. The AL LS uses a non-standard reverse-request protocol: the bridge pre-registers a waiter before sending the action, then captures the inbound `workspace/applyEdit`. Returns per-file post-edit text plus fresh diagnostics. Set `persist=false` for preview mode. |
 
 ### Build and deploy
 
 | Tool | Binary / endpoint | Description |
 |---|---|---|
-| `al_compile` | `alc` (ships with the AL extension) | Compile an AL project to a `.app` package. Returns exit code, parsed SARIF diagnostics (with file/line ranges), and the produced `.app` path. Uses the same analyzer, package cache, and ruleset config as the LSP. Linux-compatible. |
+| `al_compile` | `alc` (ships with the AL extension) | Compile an AL project to a `.app` package. Returns exit code, severity counts, the produced `.app` path, and a per-file overview (`files`: path + severity counts + distinct rule IDs). Fetch line-level detail per file with `al_get_diagnostics`, or pass `verbose=true` to inline the full per-diagnostic array. Uses the same analyzer, package cache, and ruleset config as the LSP. Linux-compatible. |
 | `al_publish` | BC `/<instance>/dev/apps` HTTP endpoint | Upload a compiled `.app` to a Business Central on-premise dev service tier. Reads server/instance/tenant from `.vscode/launch.json`. Requires `BC_USER`/`BC_PASSWORD` or a credentials file. |
 | `al_run_tests` | BC `/<instance>/dev/TestRunnerHub` SignalR | Run an AL test codeunit against a Business Central on-premise dev service tier. Reads connection info from `.vscode/launch.json`. Returns per-method pass/fail/skipped results. Serializes concurrent calls per hub to avoid BC's single-session restriction. |
 

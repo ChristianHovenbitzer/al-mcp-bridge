@@ -156,7 +156,9 @@ export interface RunCodeActionResult {
   persisted: boolean;
   changedFiles: Array<{
     uri: string;
-    before: string;
+    /** Full file text after the action applied. The pre-edit text is
+     *  intentionally omitted — it duplicates what the caller already has on
+     *  disk and doubles the payload for multi-file refactors. */
     after: string;
     diagnostics: NormalizedDiagnostic[];
   }>;
@@ -223,7 +225,6 @@ async function applyWorkspaceEdit(
     const diagnostics = await client.diagnostics.awaitNext(uri, config.diagnosticsSettleMs);
     results.push({
       uri,
-      before,
       after,
       diagnostics: diagnostics.map(normalizeDiagnostic),
     });

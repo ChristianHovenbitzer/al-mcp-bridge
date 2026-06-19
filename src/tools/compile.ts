@@ -20,6 +20,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { BridgeConfig } from "../config.js";
 
@@ -76,6 +77,14 @@ export const CompileInput = z.object({
     .boolean()
     .default(false)
     .describe("Passes /continuebuildonerror+ so alc keeps emitting diagnostics after the first error."),
+  verbose: z
+    .boolean()
+    .default(false)
+    .describe(
+      "If true, also return the full per-diagnostic array (severity, message, file, line ranges). " +
+        "Default false returns only the per-file overview (`files`: path + severity counts + rule IDs); " +
+        "fetch line-level specifics for a file with al_get_diagnostics.",
+    ),
 });
 
 export type CompileInputT = z.infer<typeof CompileInput>;
@@ -96,16 +105,41 @@ export interface CompileDiagnostic {
   category?: string;
 }
 
+/** Per-file roll-up: which file, how many of each severity, and the distinct
+ *  rule IDs present. Zero-valued severity counts are omitted. This is the
+ *  default compile payload — line/message detail is one al_get_diagnostics
+ *  call away per file. */
+export interface CompileFileSummary {
+  /** Filesystem path (absolute) ready to pass to al_get_diagnostics, or
+   *  "(project)" for diagnostics alc reports without a source file. */
+  file: string;
+  errors?: number;
+  warnings?: number;
+  info?: number;
+  hint?: number;
+  /** Distinct rule IDs in this file, sorted (e.g. ["AA0137","AL0118"]). */
+  codes: string[];
+}
+
 export interface CompileResult {
   succeeded: boolean;
   exitCode: number;
-  alcPath: string;
+  /** Path to the alc binary used. Only present when `verbose`. */
+  alcPath?: string;
   projectPath: string;
   appPath?: string;
-  diagnostics: CompileDiagnostic[];
+  /** Per-file overview — always present. */
+  files: CompileFileSummary[];
+  /** Full per-diagnostic array. Present only when `verbose=true`. */
+  diagnostics?: CompileDiagnostic[];
   counts: { error: number; warning: number; info: number; hint: number };
-  stdoutTail: string;
-  stderrTail: string;
+  /** Tail of alc's console output. Omitted on a clean run — the parsed
+   *  `diagnostics` already carry every issue, and stdout is just a
+   *  one-line-per-issue echo. Present only as a fallback when alc exited
+   *  nonzero (stderr) or produced no parseable diagnostics (stdout), where
+   *  the raw text is the only clue to what went wrong. */
+  stdoutTail?: string;
+  stderrTail?: string;
   message: string;
 }
 
@@ -213,16 +247,23 @@ export function createCompile(config: BridgeConfig) {
       ? `Compilation succeeded (${counts.warning} warnings, ${counts.info} info).${appPath ? ` Output: ${appPath}` : ""}`
       : `Compilation failed with ${counts.error} error(s), ${counts.warning} warning(s) (alc exit ${exitCode}).`;
 
+    // Only surface raw console output when it adds signal the parsed
+    // diagnostics don't already carry: stderr when alc failed, stdout when
+    // the run produced no parseable diagnostics at all (a parse/crash clue).
+    const stderrTail = exitCode !== 0 ? tail(stderr, 2000) : "";
+    const stdoutTail = diagnostics.length === 0 ? tail(stdout, 2000) : "";
+
     return {
       succeeded,
       exitCode,
-      alcPath,
+      ...(input.verbose ? { alcPath } : {}),
       projectPath,
       appPath,
-      diagnostics,
+      files: summarizeByFile(diagnostics),
+      ...(input.verbose ? { diagnostics } : {}),
       counts,
-      stdoutTail: tail(stdout, 4000),
-      stderrTail: tail(stderr, 4000),
+      ...(stdoutTail ? { stdoutTail } : {}),
+      ...(stderrTail ? { stderrTail } : {}),
       message,
     };
   };
@@ -362,6 +403,70 @@ function mapSeverity(raw: string | undefined): CompileDiagnostic["severity"] {
     default:
       return "unknown";
   }
+}
+
+/**
+ * Roll the flat diagnostic list up into one entry per file: severity counts
+ * plus the distinct rule IDs. Files are ordered errors-first so the most
+ * actionable ones lead. SARIF `file://` URIs are converted to plain
+ * filesystem paths so each entry's `file` can be passed straight to
+ * al_get_diagnostics for line-level detail.
+ */
+function summarizeByFile(diags: CompileDiagnostic[]): CompileFileSummary[] {
+  interface Acc {
+    errors: number;
+    warnings: number;
+    info: number;
+    hint: number;
+    codes: Set<string>;
+  }
+  const byFile = new Map<string, Acc>();
+  for (const d of diags) {
+    const key = fileKey(d.file);
+    let acc = byFile.get(key);
+    if (!acc) {
+      acc = { errors: 0, warnings: 0, info: 0, hint: 0, codes: new Set() };
+      byFile.set(key, acc);
+    }
+    if (d.severity === "error") acc.errors++;
+    else if (d.severity === "warning") acc.warnings++;
+    else if (d.severity === "info") acc.info++;
+    else if (d.severity === "hint") acc.hint++;
+    if (d.code) acc.codes.add(d.code);
+  }
+
+  const out: CompileFileSummary[] = [];
+  for (const [file, acc] of byFile) {
+    out.push({
+      file,
+      ...(acc.errors ? { errors: acc.errors } : {}),
+      ...(acc.warnings ? { warnings: acc.warnings } : {}),
+      ...(acc.info ? { info: acc.info } : {}),
+      ...(acc.hint ? { hint: acc.hint } : {}),
+      codes: [...acc.codes].sort(),
+    });
+  }
+  out.sort(
+    (a, b) =>
+      (b.errors ?? 0) - (a.errors ?? 0) ||
+      (b.warnings ?? 0) - (a.warnings ?? 0) ||
+      a.file.localeCompare(b.file),
+  );
+  return out;
+}
+
+/** SARIF `file://` URI → filesystem path; "(project)" when alc reports a
+ *  diagnostic with no source file (e.g. AL1021 package-cache errors). */
+function fileKey(file: string | undefined): string {
+  if (!file) return "(project)";
+  if (file.startsWith("file:")) {
+    try {
+      return fileURLToPath(file);
+    } catch {
+      return file;
+    }
+  }
+  return file;
 }
 
 function countBySeverity(diags: CompileDiagnostic[]): CompileResult["counts"] {

@@ -48,8 +48,14 @@ export function registerTools(
   const listWorkspaces = createListWorkspaces(client, config);
   const lspStatus = createLspStatus(client, config);
 
+  // Compact serialization (no pretty-print indentation). The consumer is an
+  // LLM that parses compact and pretty JSON identically, so the per-line
+  // newlines + indentation that `JSON.stringify(v, null, 2)` adds to every
+  // field of every array element are pure token overhead. Dropping them
+  // shrinks diagnostic/reference/outline payloads ~20-40% with no loss of
+  // information. Tests consume these via `JSON.parse`, so compact is safe.
   const json = (v: unknown) => ({
-    content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }],
+    content: [{ type: "text" as const, text: JSON.stringify(v) }],
   });
 
   /** Reject inputs whose `file` path isn't under any loaded workspace.
@@ -240,7 +246,9 @@ export function registerTools(
     {
       description:
         "Compile an AL project to a .app package by invoking the `alc` binary that ships with the AL extension. " +
-        "Returns exit code, parsed SARIF diagnostics (with file/line ranges), and the produced .app path. " +
+        "Returns exit code, severity counts, the produced .app path, and a per-file overview (`files`: " +
+        "path + severity counts + distinct rule IDs). For line-level message/range detail on a file, call " +
+        "al_get_diagnostics with that file path, or pass verbose=true to inline the full per-diagnostic array. " +
         "Defaults for analyzers, package cache, and ruleset come from the bridge's resolved config (same as the LSP), " +
         "but can be overridden per call. Runs on Linux — does not depend on the MS `al-mcp` server.",
       inputSchema: CompileInput.shape,
