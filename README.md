@@ -150,7 +150,7 @@ AL_PACKAGE_CACHE="/path/to/your/al/project/.alpackages" \
 node scripts/smoke.mjs "/path/to/your/al/project/src/some.al"
 ```
 
-Expected output: 13 tools listed, non-empty `al_list_objects`, an outline tree of your AL file.
+Expected output: 18 tools listed, non-empty `al_list_objects`, an outline tree of your AL file.
 
 ---
 
@@ -164,6 +164,13 @@ Expected output: 13 tools listed, non-empty `al_list_objects`, an outline tree o
 | `AL_EXTRA_CODE_ANALYZERS` | No | — | Analyzer DLLs to load **on top of** `al.codeAnalyzers` from `.vscode/settings.json`, separated by `;` or `,`. Supports `${analyzerFolder}`, `${workspaceFolder}`, `${CodeCop}`, `${AppSourceCop}`, etc. placeholders. Always-active: when a workspace sets `"al.enableCodeAnalysis": false`, these still load and the master switch is force-enabled. |
 | `AL_EXTRA_RULESETS` | No | — | `*.ruleset.json` paths to apply **in addition to** `al.ruleSetPath`, separated by `;` or `,`. The bridge merges multiple rulesets into a composite file under the OS temp directory. |
 | `AL_DIAGNOSTICS_SETTLE_MS` | No | `750` | Milliseconds `al_apply_edit` waits for the next `publishDiagnostics` notification after sending a `didChange`. Increase to `2000`+ for slow machines or large projects. |
+| `AL_BRIDGE_LSP_REQUEST_TIMEOUT_MS` | No | `60000` | Deadline for a single LSP request. On expiry the request is cancelled (`$/cancelRequest`) and the tool fails with a `TimeoutError`. |
+| `AL_BRIDGE_LSP_INIT_TIMEOUT_MS` | No | `120000` | Deadline for `initialize` and for each `al/setActiveWorkspace` (the historical hang in `al_load_workspace`). |
+| `AL_BRIDGE_LSP_READY_TIMEOUT_MS` | No | `150000` | How long a tool call waits for LSP startup before failing. |
+| `AL_BRIDGE_TOOL_TIMEOUT_MS` | No | `180000` | Outer deadline around every tool handler (`al_compile`, `al_publish`, `al_run_tests` use their own, below). |
+| `AL_BRIDGE_COMPILE_TIMEOUT_MS` | No | `600000` | Wall clock for the `alc` child; on expiry it is SIGKILLed and its partial output returned. |
+| `AL_BRIDGE_PUBLISH_TIMEOUT_MS` | No | `300000` | Deadline for the `.app` upload to the dev service tier. |
+| `AL_BRIDGE_RUN_TESTS_TIMEOUT_MS` | No | `900000` | Deadline for one test run, including the wait for its per-hub slot. |
 | `BC_USER` | No | — | Business Central username for `al_run_tests` and `al_publish`. Takes precedence over the credentials file. |
 | `BC_PASSWORD` | No | — | Business Central password. Paired with `BC_USER`. |
 | `BC_ALLOW_INVALID_CERT` | No | — | Set to `1` to skip TLS certificate validation for BC connections. Process-scoped. Prefer fixing the server certificate. |
@@ -342,6 +349,26 @@ All tools are registered in `src/tools/register.ts`. Inputs are validated with Z
 | `al_compile` | `alc` (ships with the AL extension) | Compile an AL project to a `.app` package. Returns exit code, severity counts, the produced `.app` path, and a per-file overview (`files`: path + severity counts + distinct rule IDs). Fetch line-level detail per file with `al_get_diagnostics`, or pass `verbose=true` to inline the full per-diagnostic array. Uses the same analyzer, package cache, and ruleset config as the LSP. Linux-compatible. |
 | `al_publish` | BC `/<instance>/dev/apps` HTTP endpoint | Upload a compiled `.app` to a Business Central on-premise dev service tier. Reads server/instance/tenant from `.vscode/launch.json`. Requires `BC_USER`/`BC_PASSWORD` or a credentials file. |
 | `al_run_tests` | BC `/<instance>/dev/TestRunnerHub` SignalR | Run an AL test codeunit against a Business Central on-premise dev service tier. Reads connection info from `.vscode/launch.json`. Returns per-method pass/fail/skipped results. Serializes concurrent calls per hub to avoid BC's single-session restriction. |
+
+### Session control
+
+| Tool | Description |
+|---|---|
+| `al_list_workspaces` | The AL project folders currently registered with the LSP, which one is primary, and whether the initial set was inferred by a downward filesystem scan. |
+| `al_load_workspace` | Register an **additional** project folder with the running LSP (`workspace/didChangeWorkspaceFolders` + `al/setActiveWorkspace`). |
+| `al_lsp_status` | Full diagnostic picture of the running LS: pid, uptime, generation, liveness (`alive`/`deadReason`), per-workspace analyzers with on-disk mtime, open documents, diagnostics cache, pull-diagnostics counters, effective timeouts, and a `warnings` array. Answers even while startup is stuck. |
+| `al_restart_lsp` | Kill the LS process and bring up a fresh one, optionally re-targeted with `workspace=<AL project root>`. Use it when LSP tools time out, after rebuilding an analyzer DLL (the CLR pins assemblies for the LS process lifetime, so only a respawn loads new rules), or when the session moved to another repo. Does **not** restart the MCP server process, so no client reconnect is needed. |
+
+### No unbounded waits
+
+Every wait on something outside the bridge process is bounded (see the `AL_BRIDGE_*_TIMEOUT_MS` variables in §5; `0` disables an individual deadline):
+
+- LSP requests and notifications, plus `initialize` and `al/setActiveWorkspace`. A timeout sends `$/cancelRequest` so the LS drops the abandoned work.
+- Startup readiness - a wedged `initialize` fails the individual tool call instead of blocking every tool forever.
+- An outer deadline per tool handler, so even a handler with an unbounded internal wait cannot leave the MCP call outstanding.
+- The `alc` child (SIGKILLed, partial output returned), the `.app` upload, the test run, and the wait for a per-hub test slot.
+
+A dead or wedged LS is reported as such (`al_lsp_status` → `alive: false` + a `ls-dead` warning) and every subsequent LSP tool fails fast pointing at `al_restart_lsp`, rather than burning a fresh timeout per call.
 
 ---
 
@@ -558,6 +585,10 @@ AL_REVIEWERCOP_DLL="/path/to/Socitas.ReviewerCop.dll" npm run test:e2e
 | `al_compile` fails: `AL compiler not found` | `alc` binary not beside the LS binary | The bridge derives the `alc` path from `AL_LS_PATH`. Ensure `AL_LS_PATH` points to the EditorServices host that ships in the same folder as `alc`. |
 | Claude doesn't see the tools | MCP server crashed on launch | Run `/mcp` in Claude Code to check server status and logs. Run `node scripts/smoke.mjs <file>` standalone to isolate the issue. |
 | Diagnostics settle too fast, `al_apply_edit` returns empty | `AL_DIAGNOSTICS_SETTLE_MS` too low for your machine | Increase to `2000` or more: set `AL_DIAGNOSTICS_SETTLE_MS=2000` in the MCP server env |
+| A tool call fails with `Timed out after …ms` | The LS didn't answer in time - cold symbol load, a faulted analyzer, or a wedged LS | Call `al_lsp_status` (it answers even then). If `alive: false` or the LS has been up a long time, `al_restart_lsp`. For a genuinely slow project, raise `AL_BRIDGE_LSP_REQUEST_TIMEOUT_MS` / `AL_BRIDGE_LSP_INIT_TIMEOUT_MS`. |
+| Every LSP tool fails with `AL language server is not usable: …` | The LS process exited or its JSON-RPC connection died | `al_restart_lsp` (pass `workspace` if you also want a different project). No Claude Code restart needed. |
+| The LSP is initialized against the wrong repo (bridge launched from a home directory) | Workspace was resolved from `cwd`, not from the repo you're working in | `al_restart_lsp` with `workspace=<path to the folder containing app.json>`. `al_load_workspace` also works, but a restart gives the project a clean LS with its own analyzers as primary. |
+| A rebuilt analyzer DLL's new rules don't show up | The CLR pins analyzer assemblies for the LS process lifetime | `al_restart_lsp`. `al_lsp_status` flags this as a `stale-analyzer` warning. |
 
 ---
 
@@ -565,7 +596,7 @@ AL_REVIEWERCOP_DLL="/path/to/Socitas.ReviewerCop.dll" npm run test:e2e
 
 ### Why MCP and not a CLI?
 
-The tool surface is ~13 structured operations with typed parameters and typed return payloads. MCP's tool schema enables AI parameter validation, tool discovery, and parallel calls. A CLI + Bash approach works for 2-3 primitives that return plain text; it breaks down at this scale.
+The tool surface is ~18 structured operations with typed parameters and typed return payloads. MCP's tool schema enables AI parameter validation, tool discovery, and parallel calls. A CLI + Bash approach works for 2-3 primitives that return plain text; it breaks down at this scale.
 
 ### Why TypeScript and not C# or Python?
 

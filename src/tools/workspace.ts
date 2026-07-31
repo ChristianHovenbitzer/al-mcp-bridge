@@ -87,7 +87,6 @@ export interface ListWorkspacesResult {
     codeAnalyzers: string[];
     ruleSetPath?: string;
   }>;
-  resolvedViaDownwardScan: boolean;
 }
 
 export function createListWorkspaces(client: AlLspClient, config: BridgeConfig) {
@@ -103,7 +102,6 @@ export function createListWorkspaces(client: AlLspClient, config: BridgeConfig) 
           ruleSetPath: s?.ruleSetPath,
         };
       }),
-      resolvedViaDownwardScan: config.resolvedViaDownwardScan,
     };
   };
 }

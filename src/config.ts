@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { type BridgeTimeouts, loadTimeouts } from "./timeouts.js";
 
 /**
  * Per-workspace configuration that gets forwarded to the AL LS via
@@ -43,21 +44,18 @@ export interface AlWorkspaceSettings {
 export interface BridgeConfig {
   /** Absolute path to the AL language server executable / DLL. */
   languageServerPath: string;
-  /** Primary workspace root the LSP is initialized against (first entry of `workspaceFolders`). */
+  /** Primary workspace root (first entry of `workspaceFolders`), or cwd while none is loaded. */
   workspaceRoot: string;
-  /** All discovered AL project folders (each contains an `app.json`). */
+  /** AL project folders registered with the LSP; empty until `al_load_workspace` runs. */
   workspaceFolders: string[];
   /** Optional package cache paths forwarded to the LSP. */
   packageCachePaths: string[];
   /** Per-workspace resolved settings, keyed by absolute workspace root. */
   workspaceSettings: Map<string, AlWorkspaceSettings>;
-  /** Whether the active set of workspaces was inferred via a downward scan
-   *  (true) or anchored on an upward `app.json` walk / explicit `AL_WORKSPACE`
-   *  (false). Useful for emitting startup warnings: a downward fallback
-   *  often means the bridge picked up the wrong project. */
-  resolvedViaDownwardScan: boolean;
   /** Milliseconds to wait for `publishDiagnostics` to settle after an edit. */
   diagnosticsSettleMs: number;
+  /** Deadlines for every out-of-process wait (LSP, alc, BC). */
+  timeouts: BridgeTimeouts;
   // ---- legacy mirrors of the primary workspace's settings, kept for
   // ---- backwards-compat with tools that read directly off the config.
   // ---- New code should consult `workspaceSettings.get(workspaceRoot)`.
@@ -199,95 +197,18 @@ export function resolveLanguageServerPath(): string | null {
 }
 
 /**
- * Walk upward from `start` looking for the nearest directory containing
- * `app.json`. Returns that directory, or null if none found before the
- * filesystem root.
- */
-function findAlProjectUpward(start: string): string | null {
-  let cur = resolve(start);
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
-    if (existsSync(join(cur, "app.json"))) return cur;
-    const parent = dirname(cur);
-    if (parent === cur) return null;
-    cur = parent;
-  }
-}
-
-const SKIP_DIRS = new Set([
-  "node_modules",
-  ".git",
-  ".alpackages",
-  ".altemplates",
-  ".snapshots",
-  ".vscode",
-  "bin",
-  "obj",
-  "out",
-  "dist",
-  "build",
-  ".next",
-  ".turbo",
-]);
-
-/**
- * Recursively scan up to `maxDepth` levels under `start` for folders
- * containing `app.json`. Stops descending once an AL project is found
- * (nested AL projects are uncommon and usually represent symlink loops).
- */
-function findAlProjectsDownward(start: string, maxDepth = 4): string[] {
-  const results: string[] = [];
-  const root = resolve(start);
-
-  function walk(dir: string, depth: number): void {
-    if (depth > maxDepth) return;
-    let entries: string[];
-    try {
-      entries = readdirSync(dir);
-    } catch {
-      return;
-    }
-    if (entries.includes("app.json")) {
-      results.push(dir);
-      return;
-    }
-    for (const name of entries) {
-      if (SKIP_DIRS.has(name) || name.startsWith(".")) continue;
-      const p = join(dir, name);
-      try {
-        if (statSync(p).isDirectory()) walk(p, depth + 1);
-      } catch {
-        // unreadable entry — ignore
-      }
-    }
-  }
-
-  walk(root, 0);
-  return results;
-}
-
-export interface DiscoverResult {
-  folders: string[];
-  /** True when no upward `app.json` was found and we fell back to scanning
-   *  down from cwd. The caller may want to warn — downward fallback often
-   *  catches an unintended project when the bridge launches from a tool
-   *  repo (e.g. al-mcp-bridge itself, finding tests/fixtures). */
-  viaDownwardScan: boolean;
-}
-
-/**
- * Resolve which AL project folders this bridge should serve.
+ * The bridge deliberately does NOT discover AL projects.
  *
- * Resolution order:
- *   1. `AL_WORKSPACE` (semicolon-separated list, each must exist and have `app.json`)
- *   2. Nearest `app.json` walking upward from cwd (single-project case)
- *   3. All `app.json` folders discovered by scanning subfolders of cwd (monorepo case)
+ * It is a long-lived, repo-agnostic server: one process serves every session
+ * and every checkout, and `al_compile` / `al_publish` take an explicit
+ * `projectPath` per call. Any startup guess is therefore both unnecessary and
+ * unbounded - a filesystem scan once matched a non-AL `app.json` sitting in
+ * `%TEMP%` and handed the language server an 11 GB tree to index, which cost
+ * 6-8 GB of resident memory per host.
+ *
+ * Workspaces are registered on demand through `al_load_workspace`, which
+ * validates the folder and resolves that project's own analyzer settings.
  */
-export function discoverAlWorkspaces(start: string): DiscoverResult {
-  const upward = findAlProjectUpward(start);
-  if (upward) return { folders: [upward], viaDownwardScan: false };
-  return { folders: findAlProjectsDownward(start), viaDownwardScan: true };
-}
 
 /**
  * Resolve per-workspace settings: re-read this workspace's
@@ -369,37 +290,33 @@ export function loadConfig(): BridgeConfig {
     );
   }
 
-  let workspaceFolders: string[];
-  let resolvedViaDownwardScan = false;
+  // Opt-in preload only. With no AL_WORKSPACE the bridge starts with zero
+  // workspaces and waits for al_load_workspace - see the note above.
+  const workspaceFolders: string[] = [];
   if (process.env.AL_WORKSPACE) {
-    workspaceFolders = process.env.AL_WORKSPACE.split(";")
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .map((p) => resolve(p));
-    for (const p of workspaceFolders) {
-      if (!existsSync(p)) {
-        throw new Error(`AL_WORKSPACE entry does not exist: ${p}`);
+    for (const entry of process.env.AL_WORKSPACE.split(";")) {
+      const p = entry.trim();
+      if (!p) continue;
+      const folder = resolve(p);
+      if (!existsSync(folder)) {
+        throw new Error(`AL_WORKSPACE entry does not exist: ${folder}`);
       }
-    }
-  } else {
-    const cwd = process.cwd();
-    const discovered = discoverAlWorkspaces(cwd);
-    workspaceFolders = discovered.folders;
-    resolvedViaDownwardScan = discovered.viaDownwardScan;
-    if (workspaceFolders.length === 0) {
-      throw new Error(
-        `No AL project (app.json) found at, above, or under ${cwd}. ` +
-          "Set AL_WORKSPACE to a semicolon-separated list of AL project paths.",
-      );
+      if (!existsSync(join(folder, "app.json"))) {
+        throw new Error(`AL_WORKSPACE entry has no app.json: ${folder}`);
+      }
+      workspaceFolders.push(folder);
     }
   }
 
-  const workspaceRoot = workspaceFolders[0]!;
+  // With nothing preloaded there is no primary project; cwd only supplies the
+  // child process's working directory and a base for placeholder expansion.
+  const workspaceRoot = workspaceFolders[0] ?? process.cwd();
   const workspaceSettings = new Map<string, AlWorkspaceSettings>();
   for (const folder of workspaceFolders) {
     workspaceSettings.set(folder, resolveWorkspaceSettings(folder, lsPath));
   }
-  const primary = workspaceSettings.get(workspaceRoot)!;
+  const primary =
+    workspaceSettings.get(workspaceRoot) ?? resolveWorkspaceSettings(workspaceRoot, lsPath);
 
   const packageCachePaths = (process.env.AL_PACKAGE_CACHE ?? "")
     .split(";")
@@ -411,16 +328,51 @@ export function loadConfig(): BridgeConfig {
     workspaceRoot,
     workspaceFolders,
     workspaceSettings,
-    resolvedViaDownwardScan,
     packageCachePaths,
     assemblyProbingPaths: primary.assemblyProbingPaths,
     codeAnalyzers: primary.codeAnalyzers,
     enableCodeAnalysis: primary.enableCodeAnalysis,
     enableCodeActions: primary.enableCodeActions,
     diagnosticsSettleMs: Number(process.env.AL_DIAGNOSTICS_SETTLE_MS ?? 750),
+    timeouts: loadTimeouts(),
     backgroundCodeAnalysis: primary.backgroundCodeAnalysis,
     ruleSetPath: primary.ruleSetPath,
   };
+}
+
+/**
+ * Point an existing `BridgeConfig` at a new set of AL project folders,
+ * re-reading each folder's `.vscode/settings.json`.
+ *
+ * Used by `al_restart_lsp`: the bridge is a long-lived stdio process (often
+ * launched from a directory that isn't an AL project at all), so switching it
+ * to another repo has to happen in place - the alternative would be asking
+ * the user to restart Claude Code. Mutates `config` so every tool closure
+ * that captured it keeps seeing the truth; also refreshes the legacy
+ * primary-workspace mirrors.
+ */
+export function retargetWorkspaces(
+  config: BridgeConfig,
+  folders: string[],
+): void {
+  if (folders.length === 0) throw new Error("retargetWorkspaces: no folders given");
+  const resolved = folders.map((f) => resolve(f));
+  const settings = new Map<string, AlWorkspaceSettings>();
+  for (const folder of resolved) {
+    settings.set(folder, resolveWorkspaceSettings(folder, config.languageServerPath));
+  }
+
+  config.workspaceFolders = resolved;
+  config.workspaceRoot = resolved[0]!;
+  config.workspaceSettings = settings;
+
+  const primary = settings.get(config.workspaceRoot)!;
+  config.assemblyProbingPaths = primary.assemblyProbingPaths;
+  config.codeAnalyzers = primary.codeAnalyzers;
+  config.enableCodeAnalysis = primary.enableCodeAnalysis;
+  config.enableCodeActions = primary.enableCodeActions;
+  config.backgroundCodeAnalysis = primary.backgroundCodeAnalysis;
+  config.ruleSetPath = primary.ruleSetPath;
 }
 
 // ---------------------------------------------------------------------------

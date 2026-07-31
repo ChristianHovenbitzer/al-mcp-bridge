@@ -51,7 +51,15 @@ export interface LspStatusResult {
     pid: number | null;
     startedAt: string | null;
     uptimeMs: number | null;
+    /** How many LS processes this bridge has spawned (1 = never restarted). */
+    generation: number;
+    /** False once the child exited or the JSON-RPC connection died. */
+    alive: boolean;
+    /** Why the LS is considered unusable, or null while it looks healthy. */
+    deadReason: string | null;
   };
+  /** Effective deadlines (env-overridable) every wait is bounded by. */
+  timeouts: BridgeConfig["timeouts"];
   workspaces: WorkspaceStatus[];
   openDocuments: Array<{ uri: string; version: number }>;
   diagnosticsCache: Array<{ uri: string; count: number; codes: string[] }>;
@@ -141,6 +149,14 @@ export function createLspStatus(client: AlLspClient, config: BridgeConfig) {
       };
     });
 
+    const deadReason = client.getDeadReason();
+    if (deadReason) {
+      warnings.push({
+        code: "ls-dead",
+        message: `The AL language server is not usable: ${deadReason}. Every LSP-backed tool will fail until it is respawned - call al_restart_lsp (optionally with the workspace you actually want).`,
+      });
+    }
+
     const cache = client.diagnostics.snapshotSummary();
     if (cache.length === 0 && client.getOpenDocuments().length > 0) {
       warnings.push({
@@ -156,7 +172,11 @@ export function createLspStatus(client: AlLspClient, config: BridgeConfig) {
         pid: client.getLsPid(),
         startedAt: startedAtMs !== null ? new Date(startedAtMs).toISOString() : null,
         uptimeMs: startedAtMs !== null ? Date.now() - startedAtMs : null,
+        generation: client.getGeneration(),
+        alive: client.getDeadReason() === null,
+        deadReason: client.getDeadReason(),
       },
+      timeouts: config.timeouts,
       workspaces,
       openDocuments: client.getOpenDocuments(),
       diagnosticsCache: cache,

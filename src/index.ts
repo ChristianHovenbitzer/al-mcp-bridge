@@ -12,34 +12,38 @@ async function main(): Promise<void> {
   process.stderr.write(
     `[al-mcp-bridge] starting AL LS: ${config.languageServerPath}\n`,
   );
-  process.stderr.write(
-    `[al-mcp-bridge] ${config.workspaceFolders.length} AL project(s) discovered:\n`,
-  );
-  for (const f of config.workspaceFolders) {
-    process.stderr.write(`[al-mcp-bridge]   - ${f}\n`);
-  }
-  if (config.resolvedViaDownwardScan) {
-    // Workspace inferred by scanning subfolders of cwd — usually means the
-    // bridge was launched from a place that doesn't share an `app.json`
-    // ancestor with the AL project the user actually wants. Loud warning so
-    // callers debugging "no diagnostics returned" can spot the misalignment.
+  if (config.workspaceFolders.length === 0) {
     process.stderr.write(
-      `[al-mcp-bridge] WARNING: no app.json found upward from cwd; the workspace(s) above were ` +
-        `discovered by scanning subfolders. If this isn't your target project, set AL_WORKSPACE ` +
-        `or call the al_load_workspace tool at runtime.\n`,
+      `[al-mcp-bridge] no workspace loaded - the bridge never guesses one.\n` +
+        `[al-mcp-bridge] Call al_load_workspace with the absolute path of the AL project root ` +
+        `(the folder holding app.json) before using any LSP-backed tool.\n` +
+        `[al-mcp-bridge] al_compile / al_publish / al_run_tests work without it - pass projectPath.\n`,
     );
+  } else {
+    process.stderr.write(
+      `[al-mcp-bridge] ${config.workspaceFolders.length} AL project(s) preloaded via AL_WORKSPACE:\n`,
+    );
+    for (const f of config.workspaceFolders) {
+      process.stderr.write(`[al-mcp-bridge]   - ${f}\n`);
+    }
   }
 
-  // Kick LSP init in the background so MCP is responsive immediately;
-  // tool calls await `lspReady` individually.
-  const lspReady = lsp.start().then(
-    (r) => {
-      process.stderr.write(`[al-mcp-bridge] LSP initialized\n`);
-      return r;
-    },
+  // Kick LSP init in the background so MCP is responsive immediately; tool
+  // calls await `client.ready()` individually (bounded). The rejection is
+  // consumed here so a failed startup surfaces as a per-tool error rather than
+  // an unhandled rejection that takes the whole bridge down - al_lsp_status
+  // and al_restart_lsp stay callable in that state.
+  const firstGeneration = lsp.getGeneration() + 1;
+  lsp.launch().then(
+    () => process.stderr.write(`[al-mcp-bridge] LSP initialized\n`),
     (err) => {
-      process.stderr.write(`[al-mcp-bridge] LSP init failed: ${err?.message ?? err}\n`);
-      throw err;
+      // A restart disposes the previous connection, which rejects its pending
+      // `initialize`. That's not a startup failure - don't report it as one.
+      if (lsp.getGeneration() !== firstGeneration) return;
+      process.stderr.write(
+        `[al-mcp-bridge] LSP init failed: ${err?.message ?? err}\n` +
+          `[al-mcp-bridge] call al_restart_lsp to retry (optionally with a different workspace)\n`,
+      );
     },
   );
 
@@ -47,7 +51,7 @@ async function main(): Promise<void> {
     { name: "al-mcp-bridge", version: "0.1.0" },
     { capabilities: { tools: {} } },
   );
-  registerTools(mcp, lsp, config, lspReady);
+  registerTools(mcp, lsp, config);
 
   const transport = new StdioServerTransport();
   await mcp.connect(transport);

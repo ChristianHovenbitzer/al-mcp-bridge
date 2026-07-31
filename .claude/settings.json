@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/git/al-lite/**)",
+      "Bash(gh auth *)"
+    ]
+  }
+}

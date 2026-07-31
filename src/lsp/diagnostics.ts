@@ -33,6 +33,19 @@ export class DiagnosticsCache {
     }));
   }
 
+  /**
+   * Drop every cached entry and release pending waiters with an empty set.
+   * Called on LS restart: the old generation's diagnostics say nothing about
+   * the new process, and a waiter left hanging would outlive its LS.
+   */
+  clear(): void {
+    this.byUri.clear();
+    for (const [, waiting] of this.waiters) {
+      for (const w of waiting) w([]);
+    }
+    this.waiters.clear();
+  }
+
   current(uri: string): Diagnostic[] {
     return this.byUri.get(uri) ?? [];
   }

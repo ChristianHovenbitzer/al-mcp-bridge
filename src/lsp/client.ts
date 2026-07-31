@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import { basename, normalize } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
+  CancellationTokenSource,
   createMessageConnection,
   type MessageConnection,
   StreamMessageReader,
@@ -17,6 +18,7 @@ import type {
   WorkspaceEdit,
 } from "vscode-languageserver-protocol";
 import type { AlWorkspaceSettings, BridgeConfig } from "../config.js";
+import { withTimeout } from "../timeouts.js";
 import { DiagnosticsCache } from "./diagnostics.js";
 
 /**
@@ -54,6 +56,21 @@ export class AlLspClient {
 
   /** Epoch ms when the LS child process was spawned. Null before `start()`. */
   private startedAtMs: number | null = null;
+  /**
+   * Resolves when the CURRENT LS generation finished `initialize` +
+   * `al/setActiveWorkspace`. Every tool awaits this via `ready()`; `restart()`
+   * replaces it, which is what lets a wedged generation be abandoned without
+   * tearing down the MCP process.
+   */
+  private readyPromise: Promise<InitializeResult> | null = null;
+  /** Incremented on every successful spawn. 1 = the process's first LS. */
+  private generation = 0;
+  /**
+   * Set when the child exits or the JSON-RPC connection dies. Makes further
+   * calls fail immediately with a pointer at `al_restart_lsp` instead of
+   * burning a full request timeout against a dead pipe.
+   */
+  private deadReason: string | null = null;
   /** Counters for pull-diagnostics traffic; exposed via `getStats()`. */
   private pullStats = {
     calls: 0,
@@ -93,18 +110,23 @@ export class AlLspClient {
       cwd: normalize(this.config.workspaceRoot),
     });
     this.startedAtMs = Date.now();
+    this.generation++;
+    this.deadReason = null;
     proc.stderr.on("data", (b) => process.stderr.write(`[al-ls] ${b}`));
+    // A spawn failure (bad path, EACCES on the wrong platform's binary) used
+    // to `process.exit(1)` the whole bridge. Record it instead: the pending
+    // `initialize` rejects when the streams close, the MCP transport stays up,
+    // and the caller gets an actionable error naming al_restart_lsp.
     proc.on("error", (err) => {
-      process.stderr.write(
-        `[al-mcp-bridge] LS process error: ${err.message}\n`,
-      );
-      process.exit(1);
+      process.stderr.write(`[al-mcp-bridge] LS process error: ${err.message}\n`);
+      this.markDead(`LS process error: ${err.message}`);
     });
     proc.on("exit", (code, signal) => {
-      if (this.conn) {
+      if (this.proc === proc) {
         process.stderr.write(
           `[al-mcp-bridge] LS exited (code=${code} signal=${signal})\n`,
         );
+        this.markDead(`LS process exited (code=${code} signal=${signal})`);
       }
     });
     this.proc = proc;
@@ -128,6 +150,10 @@ export class AlLspClient {
       if (waiter) waiter(p.edit);
       return { applied: true };
     });
+    conn.onClose(() => this.markDead("JSON-RPC connection to the LS closed"));
+    conn.onError(([err]) =>
+      this.markDead(`JSON-RPC connection error: ${(err as Error)?.message ?? String(err)}`),
+    );
     conn.listen();
 
     const initParams: InitializeParams = {
@@ -153,7 +179,14 @@ export class AlLspClient {
       },
     };
 
-    const result = await conn.sendRequest<InitializeResult>("initialize", initParams);
+    // `initialize` on a cold AL LS can take tens of seconds (symbol package
+    // load); it must still be bounded, because an unanswered initialize means
+    // `ready()` never resolves and EVERY tool blocks forever behind it.
+    const result = await withTimeout(
+      conn.sendRequest<InitializeResult>("initialize", initParams),
+      this.config.timeouts.lspInitMs,
+      `initialize (${this.config.workspaceRoot})`,
+    );
     await conn.sendNotification("initialized", {});
 
     // Critical: stock initialize doesn't load the AL project — the LS expects
@@ -246,7 +279,23 @@ export class AlLspClient {
     // `app.json` — diagnostics then never arrive for the analyzer's rules.
     logActiveWorkspacePayload(settings, setActive);
 
-    await conn.sendRequest("al/setActiveWorkspace", {
+    // Bounded: this is THE historical hang - `al/setActiveWorkspace` on a
+    // large project (or one whose analyzer DLL faults on load) can never
+    // answer, and it is awaited both during startup and from
+    // al_load_workspace.
+    await withTimeout(
+      this.sendActiveWorkspacePayload(conn, settings, setActive),
+      this.config.timeouts.lspInitMs,
+      `al/setActiveWorkspace (${settings.workspaceRoot})`,
+    );
+  }
+
+  private sendActiveWorkspacePayload(
+    conn: MessageConnection,
+    settings: AlWorkspaceSettings,
+    setActive: boolean,
+  ): Promise<unknown> {
+    return conn.sendRequest("al/setActiveWorkspace", {
       settings: {
         workspacePath: settings.workspaceRoot,
         setActiveWorkspace: setActive,
@@ -294,17 +343,143 @@ export class AlLspClient {
     return { ...this.pullStats };
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Tear the LS down. Disposes the connection first (so no further traffic is
+   * attempted), then SIGTERMs the child and waits up to `graceMs` for it to
+   * actually exit before SIGKILLing it. Waiting matters: a wedged AL LS
+   * ignores SIGTERM, and a leaked one keeps holding the symbol cache and its
+   * pinned analyzer DLLs while the replacement starts.
+   */
+  async stop(graceMs = 3000): Promise<void> {
+    const proc = this.proc;
     this.conn?.dispose();
     this.conn = null;
-    this.proc?.kill();
     this.proc = null;
+    this.readyPromise = null;
+    this.markDead("LS stopped by the bridge");
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+
+    await new Promise<void>((resolvePromise) => {
+      const done = () => {
+        clearTimeout(timer);
+        resolvePromise();
+      };
+      const timer = setTimeout(() => {
+        proc.removeListener("exit", done);
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+        resolvePromise();
+      }, graceMs);
+      proc.once("exit", done);
+      try {
+        proc.kill();
+      } catch {
+        done();
+      }
+    });
   }
 
-  /** Raw request passthrough — tools forward LSP calls through here. */
+  /**
+   * Spawn + initialize in the background and remember the resulting promise as
+   * this generation's readiness gate. Callers use `ready()`; the returned
+   * promise is only for startup logging.
+   */
+  launch(): Promise<InitializeResult> {
+    const p = this.start();
+    this.readyPromise = p;
+    return p;
+  }
+
+  /**
+   * Await the current generation's startup, bounded by `lspReadyMs`.
+   *
+   * The bound is per call, not per generation, on purpose: a tool call should
+   * fail with a timeout rather than inherit an unbounded wait from a startup
+   * that has been stuck for an hour.
+   */
+  async ready(): Promise<InitializeResult> {
+    if (!this.readyPromise) {
+      throw new Error(
+        "LSP client not started. Call al_restart_lsp to spawn the AL language server.",
+      );
+    }
+    return withTimeout(
+      this.readyPromise,
+      this.config.timeouts.lspReadyMs,
+      "AL language server startup",
+    );
+  }
+
+  /**
+   * Kill the current LS and bring up a fresh one against
+   * `config.workspaceFolders` as they stand now. Callers that want a different
+   * project set mutate the config first (see `retargetWorkspaces`).
+   */
+  async restart(): Promise<InitializeResult> {
+    await this.stop();
+    this.openVersions.clear();
+    this.syncedText.clear();
+    this.activeWorkspaces.length = 0;
+    this.diagnostics.clear();
+    this.pullStats = {
+      calls: 0,
+      nullResults: 0,
+      methodNotFound: 0,
+      errors: 0,
+      lastErrorCode: undefined,
+      lastErrorMessage: undefined,
+    };
+    return this.launch();
+  }
+
+  /** How many LS processes this bridge has spawned (1 = never restarted). */
+  getGeneration(): number {
+    return this.generation;
+  }
+
+  /** Why the LS is considered unusable, or null while it looks healthy. */
+  getDeadReason(): string | null {
+    return this.deadReason;
+  }
+
+  private markDead(reason: string): void {
+    this.deadReason ??= reason;
+  }
+
+  /**
+   * Raw request passthrough - every LSP-backed tool funnels through here.
+   *
+   * Bounded by `lspRequestMs` and cancelled on timeout: the AL LS answers most
+   * requests in milliseconds but will silently never answer some (a
+   * `textDocument/codeAction` on a file whose analyzer faulted, a
+   * `workspace/symbol` mid-reindex). Without the deadline the MCP tool call
+   * hangs with no output at all, which is the failure mode this exists to
+   * kill. `CancellationTokenSource` sends `$/cancelRequest` so the LS drops
+   * the abandoned work instead of finishing it into the void.
+   */
   request<R>(method: string, params: unknown): Promise<R> {
-    if (!this.conn) throw new Error("LSP client not started");
-    return this.conn.sendRequest<R>(method, params);
+    if (!this.conn) {
+      throw new Error(
+        `LSP client not started${this.deadReason ? ` (${this.deadReason})` : ""}. ` +
+          `Call al_restart_lsp to respawn the AL language server.`,
+      );
+    }
+    if (this.deadReason) {
+      throw new Error(
+        `AL language server is not usable: ${this.deadReason}. ` +
+          `Call al_restart_lsp to respawn it.`,
+      );
+    }
+    const cts = new CancellationTokenSource();
+    return withTimeout(
+      this.conn.sendRequest<R>(method, params, cts.token),
+      this.config.timeouts.lspRequestMs,
+      `LSP request ${method}`,
+      () => cts.cancel(),
+    );
   }
 
   /**
@@ -320,10 +495,13 @@ export class AlLspClient {
     if (!this.conn) throw new Error("LSP client not started");
     const conn = this.conn;
     this.pullStats.calls++;
+    const cts = new CancellationTokenSource();
     const request = conn
-      .sendRequest<{ kind?: string; items?: Diagnostic[] } | null>("textDocument/diagnostic", {
-        textDocument: { uri },
-      })
+      .sendRequest<{ kind?: string; items?: Diagnostic[] } | null>(
+        "textDocument/diagnostic",
+        { textDocument: { uri } },
+        cts.token,
+      )
       .then((report) => {
         if (!report || report.kind !== "full" || !Array.isArray(report.items)) {
           this.pullStats.nullResults++;
@@ -352,13 +530,32 @@ export class AlLspClient {
         );
         return null;
       });
-    const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), timeoutMs));
+    // Degrade to "no pull data" on timeout, but cancel the abandoned request
+    // so the LS stops working on it.
+    const timeout = new Promise<null>((resolve) => {
+      setTimeout(() => {
+        cts.cancel();
+        resolve(null);
+      }, timeoutMs);
+    });
     return Promise.race([request, timeout]);
   }
 
+  /**
+   * Fire-and-forget notification (didOpen/didChange/didClose, ...).
+   *
+   * Bounded too: the promise resolves once the message is written to the
+   * child's stdin, and a wedged LS that has stopped draining its pipe stalls
+   * that write once the OS buffer fills - which would hang a tool call before
+   * it ever issues a request.
+   */
   notify(method: string, params: unknown): Promise<void> {
     if (!this.conn) throw new Error("LSP client not started");
-    return this.conn.sendNotification(method, params);
+    return withTimeout(
+      this.conn.sendNotification(method, params),
+      this.config.timeouts.lspRequestMs,
+      `LSP notification ${method}`,
+    );
   }
 
   /**

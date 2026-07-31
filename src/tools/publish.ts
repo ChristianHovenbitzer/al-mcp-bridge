@@ -22,12 +22,22 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
+import { loadTimeouts } from "../timeouts.js";
 import {
   loadCredentials,
   normalizeServerUrl,
   readLaunchConfig,
   redact,
 } from "./runTests.js";
+
+/**
+ * Deadline for the upload leg. Read from env per call rather than threaded
+ * through `createPublish`, which only receives the workspace path.
+ */
+function publishTimeoutSignal(): AbortSignal | undefined {
+  const ms = loadTimeouts().publishMs;
+  return ms > 0 ? AbortSignal.timeout(ms) : undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Input schema
@@ -165,10 +175,21 @@ export function createPublish(primaryWorkspace: string) {
         method: "POST",
         headers: { Authorization: authHeader },
         body: form,
+        // A dev service tier that accepts the connection and then stalls
+        // mid-upgrade would otherwise hold this call open indefinitely.
+        signal: publishTimeoutSignal(),
       });
     } catch (err) {
+      const isTimeout = (err as Error)?.name === "TimeoutError";
       throw new PublishError(
-        redact(`POST ${endpoint.pathname} failed: ${(err as Error).message ?? String(err)}`),
+        redact(
+          `POST ${endpoint.pathname} failed: ${(err as Error).message ?? String(err)}` +
+            (isTimeout
+              ? ` (aborted after ${loadTimeouts().publishMs}ms - the service tier accepted the ` +
+                `connection but never finished; check whether the app landed with a manual ` +
+                `GET /dev/apps before republishing)`
+              : ""),
+        ),
       );
     }
 

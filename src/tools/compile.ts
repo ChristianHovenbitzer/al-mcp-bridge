@@ -223,7 +223,7 @@ export function createCompile(config: BridgeConfig) {
     let stderr = "";
     let exitCode = -1;
     try {
-      const res = await runAlc(alcPath, args);
+      const res = await runAlc(alcPath, args, config.timeouts.compileMs);
       stdout = res.stdout;
       stderr = res.stderr;
       exitCode = res.exitCode;
@@ -317,17 +317,52 @@ interface AlcRunResult {
   stderr: string;
 }
 
-function runAlc(alcPath: string, args: string[]): Promise<AlcRunResult> {
+/**
+ * Run `alc` and collect its output.
+ *
+ * `timeoutMs` kills the child (SIGKILL, since a stuck alc ignores SIGTERM)
+ * and rejects with whatever output it produced first. Without it a compile
+ * that wedges - alc waiting on a locked .app output file or an analyzer in an
+ * infinite loop - leaves the MCP call outstanding forever.
+ */
+function runAlc(
+  alcPath: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<AlcRunResult> {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(alcPath, args, { stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    let timer: NodeJS.Timeout | undefined;
+    const clear = () => {
+      if (timer) clearTimeout(timer);
+    };
     child.stdout.on("data", (b) => (stdout += b.toString("utf8")));
     child.stderr.on("data", (b) => (stderr += b.toString("utf8")));
-    child.on("error", rejectPromise);
+    child.on("error", (err) => {
+      clear();
+      rejectPromise(err);
+    });
     child.on("close", (code) => {
+      clear();
       resolvePromise({ exitCode: code ?? -1, stdout, stderr });
     });
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Already gone.
+        }
+        rejectPromise(
+          new Error(
+            `alc timed out after ${timeoutMs}ms and was killed. ` +
+              `stdout: ${stdout.slice(-2000) || "(empty)"} stderr: ${stderr.slice(-2000) || "(empty)"}`,
+          ),
+        );
+      }, timeoutMs);
+    }
   });
 }
 
