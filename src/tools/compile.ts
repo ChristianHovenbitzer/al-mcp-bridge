@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { BridgeConfig } from "../config.js";
+import { resolveWorkspaceSettings } from "../config.js";
 
 // ---------------------------------------------------------------------------
 // MCP-facing input schema
@@ -168,7 +169,17 @@ export function createCompile(config: BridgeConfig) {
       throw new CompileError(`No app.json at ${projectPath}; not an AL project.`);
     }
 
-    const analyzers = input.analyzers ?? config.codeAnalyzers;
+    // Analyzers and ruleset must come from the settings of the project being
+    // compiled, not from the workspace the bridge happens to have been started
+    // in. The legacy `config.codeAnalyzers` mirrors only the PRIMARY workspace:
+    // compiling another folder with it silently drops that project's analyzers
+    // (e.g. LinterCop, so no LC* findings at all) and its ruleset (which is what
+    // raises rules like LC0051/LC0072 to Warning), while the compile still
+    // reports "succeeded" with a plausible warning count.
+    const projectSettings =
+      config.workspaceSettings.get(projectPath) ??
+      resolveWorkspaceSettings(projectPath, config.languageServerPath);
+    const analyzers = input.analyzers ?? projectSettings.codeAnalyzers;
     // Precedence for the symbol cache:
     //   1. explicit input.packageCachePath (caller override)
     //   2. bridge config (AL_PACKAGE_CACHE env or al.packageCachePaths)
@@ -176,7 +187,7 @@ export function createCompile(config: BridgeConfig) {
     //   4. undefined — alc emits AL1021 "The package cache path has not been specified"
     // The convention is the default the AL extension itself uses.
     const packageCachePaths = resolvePackageCachePaths(input.packageCachePath, config.packageCachePaths, projectPath);
-    const ruleSet = input.ruleSet ?? config.ruleSetPath;
+    const ruleSet = input.ruleSet ?? projectSettings.ruleSetPath;
     // /assemblyprobingpaths is for resolving .NET assemblies referenced from
     // AL code (via 'using' directives / DotNet type declarations). It does NOT
     // affect how alc resolves dependencies of Roslyn analyzer DLLs — those are
@@ -206,8 +217,8 @@ export function createCompile(config: BridgeConfig) {
       args.push(`/ruleset:${ruleSet}`);
     }
     if (input.enableExternalRulesets) {
-      // Presence switch — alc treats the flag itself as opt-in.
-      args.push("/enableexternalrulesets");
+      // alc ignores the bare flag; only the explicit :true form lifts BlockedExternalRulesets (AL1033).
+      args.push("/enableexternalrulesets:true");
     }
     if (input.generateCode === false) {
       args.push("/generatecode-");
