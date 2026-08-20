@@ -3,7 +3,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const transport = new StdioClientTransport({
   command: process.execPath,
-  args: ["/home/hoch/git/al-mcp-bridge/dist/index.js"],
+  args: [new URL("../dist/index.js", import.meta.url).pathname],
   env: process.env,
   stderr: "inherit",
 });
@@ -31,7 +31,7 @@ try {
   await tryTool("al_symbol_search", { query: "HttpClientHandler" });
   await tryTool("al_symbol_search", { query: "Partlist" });
 
-  const file = "/home/hoch/git/blh/win-klimaX Interface/app/src/codeunit/HttpClientHandler.Codeunit.al";
+  const file = process.argv[2] ?? "/path/to/al-project/app/src/HttpClientHandler.Codeunit.al";
   await tryTool("al_get_symbol_at", { file, line: 13, character: 4 });
   await tryTool("al_find_references", { file, line: 13, character: 9 });
   await tryTool("al_format", { file });

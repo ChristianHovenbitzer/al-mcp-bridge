@@ -404,7 +404,7 @@ al-mcp-bridge/
 │   ├── smoke-compile.mjs     # Smoke test: al_compile
 │   ├── smoke-publish.mjs     # Smoke test: al_publish
 │   ├── smoke-runtests.mjs    # Smoke test: al_run_tests
-│   └── smoke-winklimax.mjs   # Smoke test: Winklimax project fixture
+│   └── smoke-fixture.mjs     # Smoke test against a local AL project fixture
 ├── tests/
 │   ├── helpers/
 │   │   └── bridge.mjs        # startBridge(), waitFor(), fixturePath() — test utilities

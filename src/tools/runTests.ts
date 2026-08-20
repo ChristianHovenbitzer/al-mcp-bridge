@@ -472,8 +472,8 @@ export function loadCredentials(origin: string, serverInstance: string): Credent
   // accept both. Scheme can also be dropped (some users key by host alone).
   const instanceLower = serverInstance.toLowerCase();
   const originUrl = new URL(origin);
-  const hostPort = originUrl.host.toLowerCase(); // e.g. docker.socitas.de:56565
-  const hostOnly = originUrl.hostname.toLowerCase(); // e.g. docker.socitas.de
+  const hostPort = originUrl.host.toLowerCase(); // e.g. bc.example.com:56565
+  const hostOnly = originUrl.hostname.toLowerCase(); // e.g. bc.example.com
   const schemeHostPort = `${originUrl.protocol}//${hostPort}`.toLowerCase();
   const schemeHostOnly = `${originUrl.protocol}//${hostOnly}`.toLowerCase();
 

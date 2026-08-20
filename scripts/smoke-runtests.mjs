@@ -15,7 +15,7 @@ import { createRunTests, redact } from "../dist/tools/runTests.js";
 import assert from "node:assert/strict";
 
 const projectPath =
-  process.argv[2] ?? "/home/hoch/git/proaurum/General Customizations/test";
+  process.argv[2] ?? "/path/to/al-project/test";
 
 // ---------- 1. redact() ------------------------------------------------------
 {
