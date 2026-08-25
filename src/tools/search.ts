@@ -2,11 +2,11 @@ import { z } from "zod";
 import type { AlLspClient } from "../lsp/client.js";
 
 /**
- * AL-specific search endpoints. These forward to the LS's own MCP-style
- * tools exposed over LSP (see SymbolSearchService in the decompiled
- * workspaces bundle). We intentionally pass the `params` object through
- * with minimal reshaping — the LS side is the source of truth for the
- * filter schema.
+ * AL-specific search endpoints, forwarded to the LS's own MCP-style tools over
+ * LSP. The LS is the source of truth for each request shape, so match its
+ * contract exactly rather than passing our own input through unreshaped — a
+ * field the contract does not declare is dropped silently, with a successful
+ * response and no warning.
  */
 
 export const SymbolSearchInput = z.object({
@@ -32,9 +32,14 @@ export async function symbolSearch(
   client: AlLspClient,
   input: SymbolSearchInputT,
 ): Promise<unknown> {
+  // The LS contract is SymbolSearchParameters { Query, Filters } — defined in
+  // Microsoft.Dynamics.Nav.CodeAnalysis.Workspaces.dll, namespace
+  // …LanguageModelTools.SymbolSearch. Filters must therefore be nested; spread
+  // to the top level they match no property and are dropped without an error,
+  // leaving only `query` (an object-name match) in effect.
   return client.request<unknown>("al/symbolSearch", {
     query: input.query,
-    ...(input.filters ?? {}),
+    filters: input.filters ?? {},
   });
 }
 
