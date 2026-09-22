@@ -17,7 +17,16 @@
  * of them per-invocation.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +37,14 @@ import { resolveWorkspaceSettings } from "../config.js";
 // ---------------------------------------------------------------------------
 // MCP-facing input schema
 // ---------------------------------------------------------------------------
+
+/** Default inline-diagnostic budget before the result is summarized. Chosen
+ *  so a verbose compile with the full per-diagnostic array stays well inside
+ *  an MCP client's tool-result token limit. */
+export const DEFAULT_MAX_DIAGNOSTICS = 40;
+
+/** How many rule IDs `byRule` lists when the guard trips. */
+export const MAX_RULE_ROWS = 15;
 
 export const CompileInput = z.object({
   projectPath: z
@@ -86,7 +103,38 @@ export const CompileInput = z.object({
         "Default false returns only the per-file overview (`files`: path + severity counts + rule IDs); " +
         "fetch line-level specifics for a file with al_get_diagnostics.",
     ),
+  maxDiagnostics: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(
+      "Size guard. When the compile yields MORE diagnostics than this, the result is summarized instead of " +
+        "listing everything: `byRule` (top rule IDs by count), `truncated` (totals), the first N diagnostics " +
+        "ordered errors-first, `files` capped to N entries, and `fullDiagnosticsPath` — an absolute path to a " +
+        "JSON file holding the complete list. At or below the threshold the result is unchanged. " +
+        `Default ${DEFAULT_MAX_DIAGNOSTICS}, or the AL_BRIDGE_MAX_DIAGNOSTICS env var.`,
+    ),
 });
+
+/**
+ * Resolve the effective threshold: explicit tool parameter first, then the
+ * AL_BRIDGE_MAX_DIAGNOSTICS env var, then the built-in default. A malformed
+ * or non-positive env value falls back to the default rather than disabling
+ * the guard — a silently unbounded result is the failure this exists to stop.
+ */
+export function resolveMaxDiagnostics(
+  explicit: number | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (typeof explicit === "number" && Number.isInteger(explicit) && explicit >= 1) return explicit;
+  const raw = env.AL_BRIDGE_MAX_DIAGNOSTICS?.trim();
+  if (raw) {
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= 1) return n;
+  }
+  return DEFAULT_MAX_DIAGNOSTICS;
+}
 
 export type CompileInputT = z.infer<typeof CompileInput>;
 
@@ -122,6 +170,29 @@ export interface CompileFileSummary {
   codes: string[];
 }
 
+/** One row of the rule-ID roll-up emitted when the size guard trips. */
+export interface CompileRuleCount {
+  /** Rule ID (e.g. "AA0137"), or "(none)" for diagnostics alc reports without one. */
+  code: string;
+  /** Highest severity observed for this rule. */
+  severity: CompileDiagnostic["severity"];
+  count: number;
+}
+
+/** Totals describing what the size guard cut from the inline result. */
+export interface CompileTruncation {
+  /** Diagnostics the compile produced in total. */
+  total: number;
+  /** Diagnostics listed inline in `diagnostics` (errors first). */
+  shown: number;
+  /** Distinct files with diagnostics. */
+  filesTotal: number;
+  /** Entries kept in `files`. */
+  filesShown: number;
+  /** The threshold that tripped the guard. */
+  maxDiagnostics: number;
+}
+
 export interface CompileResult {
   succeeded: boolean;
   exitCode: number;
@@ -129,11 +200,22 @@ export interface CompileResult {
   alcPath?: string;
   projectPath: string;
   appPath?: string;
-  /** Per-file overview — always present. */
+  /** Per-file overview — always present. Capped to `maxDiagnostics`
+   *  entries (errors-first order) when the size guard trips. */
   files: CompileFileSummary[];
-  /** Full per-diagnostic array. Present only when `verbose=true`. */
+  /** Per-diagnostic array. Present when `verbose=true`, or when the size
+   *  guard trips (then capped to the first `maxDiagnostics`, errors first,
+   *  so the caller never has to open the full file just to see the errors). */
   diagnostics?: CompileDiagnostic[];
   counts: { error: number; warning: number; info: number; hint: number };
+  /** Top rule IDs by count. Present only when the size guard trips. */
+  byRule?: CompileRuleCount[];
+  /** What the guard cut. Present only when the size guard trips. */
+  truncated?: CompileTruncation;
+  /** Absolute path of a JSON file holding EVERY diagnostic (errors first)
+   *  plus the full `byRule` roll-up. Present only when the size guard trips
+   *  and the file could be written. */
+  fullDiagnosticsPath?: string;
   /** Tail of alc's console output. Omitted on a clean run — the parsed
    *  `diagnostics` already carry every issue, and stdout is just a
    *  one-line-per-issue echo. Present only as a fallback when alc exited
@@ -250,34 +332,191 @@ export function createCompile(config: BridgeConfig) {
       // best-effort cleanup — tmpdir entries expire on reboot anyway
     }
 
-    const counts = countBySeverity(diagnostics);
     const appPath = input.generateCode === false ? undefined : locateAppOutput(projectPath, input.outputPath);
 
-    const succeeded = exitCode === 0 && counts.error === 0;
-    const message = succeeded
-      ? `Compilation succeeded (${counts.warning} warnings, ${counts.info} info).${appPath ? ` Output: ${appPath}` : ""}`
-      : `Compilation failed with ${counts.error} error(s), ${counts.warning} warning(s) (alc exit ${exitCode}).`;
-
-    // Only surface raw console output when it adds signal the parsed
-    // diagnostics don't already carry: stderr when alc failed, stdout when
-    // the run produced no parseable diagnostics at all (a parse/crash clue).
-    const stderrTail = exitCode !== 0 ? tail(stderr, 2000) : "";
-    const stdoutTail = diagnostics.length === 0 ? tail(stdout, 2000) : "";
-
-    return {
-      succeeded,
+    return buildCompileResult({
+      diagnostics,
       exitCode,
-      ...(input.verbose ? { alcPath } : {}),
+      stdout,
+      stderr,
       projectPath,
       appPath,
-      files: summarizeByFile(diagnostics),
-      ...(input.verbose ? { diagnostics } : {}),
-      counts,
-      ...(stdoutTail ? { stdoutTail } : {}),
-      ...(stderrTail ? { stderrTail } : {}),
-      message,
-    };
+      alcPath,
+      verbose: input.verbose,
+      maxDiagnostics: resolveMaxDiagnostics(input.maxDiagnostics),
+    });
   };
+}
+
+// ---------------------------------------------------------------------------
+// Result assembly + size guard
+// ---------------------------------------------------------------------------
+
+export interface BuildCompileResultParams {
+  diagnostics: CompileDiagnostic[];
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  projectPath: string;
+  appPath?: string;
+  alcPath?: string;
+  verbose: boolean;
+  maxDiagnostics: number;
+  /** Where the full-list file goes when the guard trips. Defaults to
+   *  `<os tmp>/al-mcp-bridge/compile-diagnostics` — the same scratch root
+   *  config.ts uses for merged rulesets. Overridable for tests. */
+  fullListDir?: string;
+}
+
+/**
+ * Shape the MCP result from parsed diagnostics. Pure apart from the one
+ * file write when the size guard trips, so it can be unit-tested with
+ * synthetic diagnostics and no alc.
+ *
+ * Guard semantics: when `diagnostics.length > maxDiagnostics` the inline
+ * payload is bounded — `diagnostics` holds the first `maxDiagnostics` in
+ * errors-first order (errors are never displaced by warnings), `files` is
+ * capped to `maxDiagnostics` entries (already errors-first), and `byRule`,
+ * `truncated` and `fullDiagnosticsPath` are added. At or below the
+ * threshold the result is byte-for-byte what it was before the guard.
+ */
+export function buildCompileResult(p: BuildCompileResultParams): CompileResult {
+  const { diagnostics, exitCode, projectPath, appPath, verbose } = p;
+  const counts = countBySeverity(diagnostics);
+  const succeeded = exitCode === 0 && counts.error === 0;
+  let message = succeeded
+    ? `Compilation succeeded (${counts.warning} warnings, ${counts.info} info).${appPath ? ` Output: ${appPath}` : ""}`
+    : `Compilation failed with ${counts.error} error(s), ${counts.warning} warning(s) (alc exit ${exitCode}).`;
+
+  // Only surface raw console output when it adds signal the parsed
+  // diagnostics don't already carry: stderr when alc failed, stdout when
+  // the run produced no parseable diagnostics at all (a parse/crash clue).
+  const stderrTail = exitCode !== 0 ? tail(p.stderr, 2000) : "";
+  const stdoutTail = diagnostics.length === 0 ? tail(p.stdout, 2000) : "";
+
+  const allFiles = summarizeByFile(diagnostics);
+  const guardTripped = diagnostics.length > p.maxDiagnostics;
+
+  let files = allFiles;
+  let inline: CompileDiagnostic[] | undefined = verbose ? diagnostics : undefined;
+  let byRule: CompileRuleCount[] | undefined;
+  let truncated: CompileTruncation | undefined;
+  let fullDiagnosticsPath: string | undefined;
+
+  if (guardTripped) {
+    const ordered = sortErrorsFirst(diagnostics);
+    const allRules = countByRule(diagnostics);
+    inline = ordered.slice(0, p.maxDiagnostics);
+    files = allFiles.slice(0, p.maxDiagnostics);
+    byRule = allRules.slice(0, MAX_RULE_ROWS);
+    truncated = {
+      total: diagnostics.length,
+      shown: inline.length,
+      filesTotal: allFiles.length,
+      filesShown: files.length,
+      maxDiagnostics: p.maxDiagnostics,
+    };
+    fullDiagnosticsPath = writeFullDiagnostics(
+      p.fullListDir ?? join(tmpdir(), "al-mcp-bridge", "compile-diagnostics"),
+      projectPath,
+      { counts, byRule: allRules, diagnostics: ordered },
+    );
+    message +=
+      ` ${diagnostics.length} diagnostics exceed maxDiagnostics=${p.maxDiagnostics}; ` +
+      `inline: first ${inline.length} (errors first), ${files.length}/${allFiles.length} files, top ${byRule.length} rule IDs.` +
+      (fullDiagnosticsPath
+        ? ` Full list: ${fullDiagnosticsPath}`
+        : " Full list could not be written; use al_get_diagnostics per file.");
+  }
+
+  return {
+    succeeded,
+    exitCode,
+    ...(verbose && p.alcPath ? { alcPath: p.alcPath } : {}),
+    projectPath,
+    appPath,
+    files,
+    ...(inline ? { diagnostics: inline } : {}),
+    counts,
+    ...(byRule ? { byRule } : {}),
+    ...(truncated ? { truncated } : {}),
+    ...(fullDiagnosticsPath ? { fullDiagnosticsPath } : {}),
+    ...(stdoutTail ? { stdoutTail } : {}),
+    ...(stderrTail ? { stderrTail } : {}),
+    message,
+  };
+}
+
+const SEVERITY_RANK: Record<CompileDiagnostic["severity"], number> = {
+  error: 0,
+  warning: 1,
+  info: 2,
+  hint: 3,
+  unknown: 4,
+};
+
+/** Stable sort: errors, then warnings, info, hint, unknown; alc's original
+ *  order is preserved within each severity. */
+export function sortErrorsFirst(diags: CompileDiagnostic[]): CompileDiagnostic[] {
+  return diags
+    .map((d, i) => ({ d, i }))
+    .sort((a, b) => SEVERITY_RANK[a.d.severity] - SEVERITY_RANK[b.d.severity] || a.i - b.i)
+    .map((x) => x.d);
+}
+
+/** Count diagnostics per rule ID, most frequent first (ties by code). The
+ *  severity reported is the highest one seen for that rule. */
+export function countByRule(diags: CompileDiagnostic[]): CompileRuleCount[] {
+  const acc = new Map<string, CompileRuleCount>();
+  for (const d of diags) {
+    const code = d.code ?? "(none)";
+    const row = acc.get(code);
+    if (!row) {
+      acc.set(code, { code, severity: d.severity, count: 1 });
+    } else {
+      row.count++;
+      if (SEVERITY_RANK[d.severity] < SEVERITY_RANK[row.severity]) row.severity = d.severity;
+    }
+  }
+  return [...acc.values()].sort((a, b) => b.count - a.count || a.code.localeCompare(b.code));
+}
+
+/**
+ * Persist the complete diagnostic list so the inline result can stay small.
+ * One file per project (sha1 of the path), overwritten on every guarded
+ * compile — the path is handed back in the same result, so there is nothing
+ * to accumulate or clean up. Diagnostics are written one per line so a
+ * caller can Read/grep the file in slices without parsing the whole thing.
+ * Returns undefined (never throws) when the write fails; the result then
+ * says so in `message`.
+ */
+function writeFullDiagnostics(
+  dir: string,
+  projectPath: string,
+  body: { counts: CompileResult["counts"]; byRule: CompileRuleCount[]; diagnostics: CompileDiagnostic[] },
+): string | undefined {
+  const hash = createHash("sha1").update(projectPath).digest("hex").slice(0, 8);
+  const file = join(dir, `${hash}.compile-diagnostics.json`);
+  const header = JSON.stringify({
+    projectPath,
+    generatedAt: new Date().toISOString(),
+    total: body.diagnostics.length,
+    counts: body.counts,
+    byRule: body.byRule,
+  });
+  // `{...header fields..., "diagnostics": [\n one per line \n]}`
+  const lines = body.diagnostics.map((d) => "  " + JSON.stringify(d));
+  const text = `${header.slice(0, -1)},"diagnostics":[\n${lines.join(",\n")}\n]}\n`;
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(file, text, "utf8");
+    return resolve(file);
+  } catch (err) {
+    process.stderr.write(
+      `[al-mcp-bridge] failed to write full diagnostic list at ${file}: ${(err as Error).message}\n`,
+    );
+    return undefined;
+  }
 }
 
 // ---------------------------------------------------------------------------

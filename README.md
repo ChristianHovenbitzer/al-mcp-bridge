@@ -169,6 +169,7 @@ Expected output: 18 tools listed, non-empty `al_list_objects`, an outline tree o
 | `AL_BRIDGE_LSP_READY_TIMEOUT_MS` | No | `150000` | How long a tool call waits for LSP startup before failing. |
 | `AL_BRIDGE_TOOL_TIMEOUT_MS` | No | `180000` | Outer deadline around every tool handler (`al_compile`, `al_publish`, `al_run_tests` use their own, below). |
 | `AL_BRIDGE_COMPILE_TIMEOUT_MS` | No | `600000` | Wall clock for the `alc` child; on expiry it is SIGKILLed and its partial output returned. |
+| `AL_BRIDGE_MAX_DIAGNOSTICS` | No | `40` | `al_compile` size guard: above this many diagnostics the result is summarized (`byRule`, `truncated`, first N errors-first, `files` capped) and the complete list is written to `fullDiagnosticsPath` under `<os tmp>/al-mcp-bridge/compile-diagnostics/`. The `maxDiagnostics` tool parameter overrides it per call. |
 | `AL_BRIDGE_PUBLISH_TIMEOUT_MS` | No | `300000` | Deadline for the `.app` upload to the dev service tier. |
 | `AL_BRIDGE_RUN_TESTS_TIMEOUT_MS` | No | `900000` | Deadline for one test run, including the wait for its per-hub slot. |
 | `BC_USER` | No | — | Business Central username for `al_run_tests` and `al_publish`. Takes precedence over the credentials file. |
@@ -346,7 +347,7 @@ All tools are registered in `src/tools/register.ts`. Inputs are validated with Z
 
 | Tool | Binary / endpoint | Description |
 |---|---|---|
-| `al_compile` | `alc` (ships with the AL extension) | Compile an AL project to a `.app` package. Returns exit code, severity counts, the produced `.app` path, and a per-file overview (`files`: path + severity counts + distinct rule IDs). Fetch line-level detail per file with `al_get_diagnostics`, or pass `verbose=true` to inline the full per-diagnostic array. Uses the same analyzer, package cache, and ruleset config as the LSP. Linux-compatible. |
+| `al_compile` | `alc` (ships with the AL extension) | Compile an AL project to a `.app` package. Returns exit code, severity counts, the produced `.app` path, and a per-file overview (`files`: path + severity counts + distinct rule IDs). Fetch line-level detail per file with `al_get_diagnostics`, or pass `verbose=true` to inline the full per-diagnostic array. **Size guard:** above `maxDiagnostics` (default 40, env `AL_BRIDGE_MAX_DIAGNOSTICS`) the result is summarized — `byRule` (top 15 rule IDs), `truncated` totals, the first N diagnostics errors-first, `files` capped to N — and `fullDiagnosticsPath` points at a JSON file (one diagnostic per line, errors first) holding the complete list. Uses the same analyzer, package cache, and ruleset config as the LSP. Linux-compatible. |
 | `al_publish` | BC `/<instance>/dev/apps` HTTP endpoint | Upload a compiled `.app` to a Business Central on-premise dev service tier. Reads server/instance/tenant from `.vscode/launch.json`. Requires `BC_USER`/`BC_PASSWORD` or a credentials file. |
 | `al_run_tests` | BC `/<instance>/dev/TestRunnerHub` SignalR | Run an AL test codeunit against a Business Central on-premise dev service tier. Reads connection info from `.vscode/launch.json`. Returns per-method pass/fail/skipped results. Serializes concurrent calls per hub to avoid BC's single-session restriction. |
 

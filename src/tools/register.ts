@@ -249,6 +249,11 @@ export function registerTools(
       "Returns exit code, severity counts, the produced .app path, and a per-file overview (`files`: " +
       "path + severity counts + distinct rule IDs). For line-level message/range detail on a file, call " +
       "al_get_diagnostics with that file path, or pass verbose=true to inline the full per-diagnostic array. " +
+      "Size guard: when more than maxDiagnostics (default 40, env AL_BRIDGE_MAX_DIAGNOSTICS) diagnostics are " +
+      "produced, the result is summarized instead — `counts`, `byRule` (top 15 rule IDs), the first N " +
+      "diagnostics errors-first, `files` capped to N, `truncated` totals, and `fullDiagnosticsPath`: an absolute " +
+      "path to a JSON file (one diagnostic per line, errors first) with the COMPLETE list. Read that file, or " +
+      "al_get_diagnostics per file, instead of re-running with a huge maxDiagnostics. " +
       "Defaults for analyzers, package cache, and ruleset come from the bridge's resolved config (same as the LSP), " +
       "but can be overridden per call. Runs on Linux - does not depend on the MS `al-mcp` server.",
     CompileInput.shape,
