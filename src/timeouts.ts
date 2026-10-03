@@ -20,6 +20,8 @@ export interface BridgeTimeouts {
   toolMs: number;
   /** `alc` child process wall clock. */
   compileMs: number;
+  /** One `al_compile_delta` call: two alc runs plus snapshot and diff. */
+  compileDeltaMs: number;
   /** `.app` upload to the dev service tier. */
   publishMs: number;
   /** One `al_run_tests` invocation, including the wait for its hub slot. */
@@ -32,6 +34,8 @@ const DEFAULTS: BridgeTimeouts = {
   lspReadyMs: 150_000,
   toolMs: 180_000,
   compileMs: 600_000,
+  // 2 x compileMs + 120 s for the snapshot, diff and match.
+  compileDeltaMs: 1_320_000,
   publishMs: 300_000,
   runTestsMs: 900_000,
 };
@@ -42,6 +46,7 @@ const ENV_KEYS: Record<keyof BridgeTimeouts, string> = {
   lspReadyMs: "AL_BRIDGE_LSP_READY_TIMEOUT_MS",
   toolMs: "AL_BRIDGE_TOOL_TIMEOUT_MS",
   compileMs: "AL_BRIDGE_COMPILE_TIMEOUT_MS",
+  compileDeltaMs: "AL_BRIDGE_COMPILE_DELTA_TIMEOUT_MS",
   publishMs: "AL_BRIDGE_PUBLISH_TIMEOUT_MS",
   runTestsMs: "AL_BRIDGE_RUN_TESTS_TIMEOUT_MS",
 };

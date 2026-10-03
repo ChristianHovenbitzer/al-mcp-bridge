@@ -24,6 +24,7 @@ import {
 } from "./codeActions.js";
 import { RunTestsInput, createRunTests } from "./runTests.js";
 import { CompileInput, createCompile } from "./compile.js";
+import { CompileDeltaInput, createCompileDelta } from "./compileDelta/index.js";
 import { PublishInput, createPublish } from "./publish.js";
 import {
   ListWorkspacesInput,
@@ -45,6 +46,7 @@ export function registerTools(
   const runCodeAction = createRunCodeAction(client, config);
   const runTests = createRunTests(config.workspaceRoot);
   const compile = createCompile(config);
+  const compileDelta = createCompileDelta(config);
   const publish = createPublish(config.workspaceRoot);
   const loadWorkspace = createLoadWorkspace(client, config);
   const listWorkspaces = createListWorkspaces(client, config);
@@ -261,6 +263,22 @@ export function registerTools(
     // The alc child enforces its own kill deadline; keep the outer guard above
     // it so the inner error (with partial output) is what surfaces.
     t.compileMs + 30_000,
+  );
+
+  tool(
+    "al_compile_delta",
+    "Which compiler/analyzer diagnostics did THIS change introduce? Compiles the base (baseRef, or the merge-base " +
+      "with targetBranch — one is required) and the head (working tree by default) as two full, non-incremental alc " +
+      "runs in sandbox snapshots with identical analyzers/ruleset/symbols, then matches them through the git diff's " +
+      "line map. ALL LINES ARE 1-BASED (al_compile's are 0-based). Returns `verdict` (clean | new-diagnostics | " +
+      "head-errors | inconclusive), `new` rows tagged mine (on a line the change added/replaced) or induced (elsewhere, " +
+      "e.g. an LC0044 partner), `onTouchedLines` (pre-existing diagnostics on lines the change touched), counts, and " +
+      "`fullReportPath` (every row with its classification, one per line). A side with compile errors runs no " +
+      "analyzers, so its warning counts are null, never 0, and the verdict is inconclusive or head-errors. Errors " +
+      "present on both sides are `environmental` (usually the symbol cache). A missing AiCop never yields clean.",
+    CompileDeltaInput.shape,
+    async (input) => compileDelta(input),
+    t.compileDeltaMs,
   );
 
   tool(

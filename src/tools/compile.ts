@@ -276,61 +276,20 @@ export function createCompile(config: BridgeConfig) {
     // handled by Roslyn's AssemblyLoadContext, which is why the bridge instead
     // prepends common helper DLLs (Analyzers.Common, ALCops.Common, …) as
     // explicit /analyzer: entries via augmentWithAnalyzerSiblings in config.ts.
-    const probingPaths = config.assemblyProbingPaths;
-
-    const tmpDir = mkdtempSync(join(tmpdir(), "al-compile-"));
-    const errorLogPath = join(tmpDir, "errors.json");
-
-    const args: string[] = [`/project:${projectPath}`, `/errorlog:${errorLogPath}`];
-    if (input.outputPath) {
-      args.push(`/out:${resolve(input.outputPath)}`);
-    }
-    for (const p of packageCachePaths) {
-      args.push(`/packagecachepath:${p}`);
-    }
-    for (const p of probingPaths) {
-      args.push(`/assemblyprobingpaths:${p}`);
-    }
-    if (analyzers && analyzers.length > 0) {
-      // alc accepts one /analyzer:<path> per DLL.
-      for (const a of analyzers) args.push(`/analyzer:${a}`);
-    }
-    if (ruleSet) {
-      args.push(`/ruleset:${ruleSet}`);
-    }
-    if (input.enableExternalRulesets) {
-      // alc ignores the bare flag; only the explicit :true form lifts BlockedExternalRulesets (AL1033).
-      args.push("/enableexternalrulesets:true");
-    }
-    if (input.generateCode === false) {
-      args.push("/generatecode-");
-    }
-    if (input.warningsAsErrors) {
-      args.push("/warnaserror+");
-    }
-    if (input.continueOnError) {
-      args.push("/continuebuildonerror+");
-    }
-
-    let stdout = "";
-    let stderr = "";
-    let exitCode = -1;
-    try {
-      const res = await runAlc(alcPath, args, config.timeouts.compileMs);
-      stdout = res.stdout;
-      stderr = res.stderr;
-      exitCode = res.exitCode;
-    } finally {
-      // We still need the errorlog after spawn finishes, so read before
-      // cleanup. If alc crashed we may not have one.
-    }
-
-    const diagnostics = existsSync(errorLogPath) ? parseErrorLog(readFileSync(errorLogPath, "utf8")) : [];
-    try {
-      rmSync(tmpDir, { recursive: true, force: true });
-    } catch {
-      // best-effort cleanup — tmpdir entries expire on reboot anyway
-    }
+    const { diagnostics, exitCode, stdout, stderr } = await runAlcCompile({
+      alcPath,
+      projectPath,
+      outputPath: input.outputPath ? resolve(input.outputPath) : undefined,
+      packageCachePaths,
+      assemblyProbingPaths: config.assemblyProbingPaths,
+      analyzers,
+      ruleSet,
+      enableExternalRulesets: input.enableExternalRulesets,
+      generateCode: input.generateCode,
+      warningsAsErrors: input.warningsAsErrors,
+      continueOnError: input.continueOnError,
+      timeoutMs: config.timeouts.compileMs,
+    });
 
     const appPath = input.generateCode === false ? undefined : locateAppOutput(projectPath, input.outputPath);
 
@@ -346,6 +305,93 @@ export function createCompile(config: BridgeConfig) {
       maxDiagnostics: resolveMaxDiagnostics(input.maxDiagnostics),
     });
   };
+}
+
+// ---------------------------------------------------------------------------
+// One alc run (shared by al_compile and al_compile_delta)
+// ---------------------------------------------------------------------------
+
+export interface AlcCompileParams {
+  alcPath: string;
+  projectPath: string;
+  outputPath?: string;
+  packageCachePaths: string[];
+  assemblyProbingPaths: string[];
+  analyzers?: string[];
+  ruleSet?: string;
+  enableExternalRulesets: boolean;
+  generateCode: boolean;
+  warningsAsErrors?: boolean;
+  continueOnError?: boolean;
+  timeoutMs: number;
+  /** Keep only the last N chars of stdout/stderr. Unbounded when omitted.
+   *  Diagnostics come from the errorlog file, so the console text is only a
+   *  crash clue and a bounded tail is enough. */
+  maxOutputChars?: number;
+}
+
+export interface AlcCompileRun {
+  diagnostics: CompileDiagnostic[];
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  /** False when alc wrote no errorlog at all (crash / bad args), as opposed
+   *  to "compiled with errors". */
+  errorLogWritten: boolean;
+}
+
+/**
+ * Build the alc argument list, run it, and parse its errorlog. Lines in the
+ * returned diagnostics are 0-based (see parseErrorLog).
+ */
+export async function runAlcCompile(p: AlcCompileParams): Promise<AlcCompileRun> {
+  const tmpDir = mkdtempSync(join(tmpdir(), "al-compile-"));
+  const errorLogPath = join(tmpDir, "errors.json");
+
+  const args: string[] = [`/project:${p.projectPath}`, `/errorlog:${errorLogPath}`];
+  if (p.outputPath) {
+    args.push(`/out:${p.outputPath}`);
+  }
+  for (const c of p.packageCachePaths) {
+    args.push(`/packagecachepath:${c}`);
+  }
+  for (const c of p.assemblyProbingPaths) {
+    args.push(`/assemblyprobingpaths:${c}`);
+  }
+  if (p.analyzers && p.analyzers.length > 0) {
+    // alc accepts one /analyzer:<path> per DLL.
+    for (const a of p.analyzers) args.push(`/analyzer:${a}`);
+  }
+  if (p.ruleSet) {
+    args.push(`/ruleset:${p.ruleSet}`);
+  }
+  if (p.enableExternalRulesets) {
+    // alc ignores the bare flag; only the explicit :true form lifts BlockedExternalRulesets (AL1033).
+    args.push("/enableexternalrulesets:true");
+  }
+  if (p.generateCode === false) {
+    args.push("/generatecode-");
+  }
+  if (p.warningsAsErrors) {
+    args.push("/warnaserror+");
+  }
+  if (p.continueOnError) {
+    args.push("/continuebuildonerror+");
+  }
+
+  try {
+    const res = await runAlc(p.alcPath, args, p.timeoutMs, p.maxOutputChars);
+    // Read the errorlog before cleanup. If alc crashed there may be none.
+    const errorLogWritten = existsSync(errorLogPath);
+    const diagnostics = errorLogWritten ? parseErrorLog(readFileSync(errorLogPath, "utf8")) : [];
+    return { diagnostics, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, errorLogWritten };
+  } finally {
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup — tmpdir entries expire on reboot anyway
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -529,7 +575,7 @@ function writeFullDiagnostics(
  * `<projectPath>/.alpackages` convention (which is what `AL: Download
  * symbols` populates and what the AL extension defaults to).
  */
-function resolvePackageCachePaths(
+export function resolvePackageCachePaths(
   override: string | undefined,
   configured: string[],
   projectPath: string,
@@ -544,7 +590,7 @@ function resolvePackageCachePaths(
 // alc location
 // ---------------------------------------------------------------------------
 
-function resolveAlcPath(languageServerPath: string): string {
+export function resolveAlcPath(languageServerPath: string): string {
   const dir = dirname(languageServerPath);
   // Linux: `alc`; Windows: `alc.exe`. The EditorServices host folder
   // always carries both the host and alc at the same level.
@@ -579,6 +625,7 @@ function runAlc(
   alcPath: string,
   args: string[],
   timeoutMs: number,
+  maxOutputChars?: number,
 ): Promise<AlcRunResult> {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(alcPath, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -588,8 +635,13 @@ function runAlc(
     const clear = () => {
       if (timer) clearTimeout(timer);
     };
-    child.stdout.on("data", (b) => (stdout += b.toString("utf8")));
-    child.stderr.on("data", (b) => (stderr += b.toString("utf8")));
+    // Trim at twice the cap so the slice runs rarely, not on every chunk.
+    const append = (acc: string, b: Buffer) => {
+      const next = acc + b.toString("utf8");
+      return maxOutputChars && next.length > 2 * maxOutputChars ? next.slice(-maxOutputChars) : next;
+    };
+    child.stdout.on("data", (b) => (stdout = append(stdout, b)));
+    child.stderr.on("data", (b) => (stderr = append(stderr, b)));
     child.on("error", (err) => {
       clear();
       rejectPromise(err);
@@ -642,7 +694,7 @@ interface SarifIssue {
   };
 }
 
-function parseErrorLog(raw: string): CompileDiagnostic[] {
+export function parseErrorLog(raw: string): CompileDiagnostic[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
