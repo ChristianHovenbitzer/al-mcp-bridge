@@ -98,6 +98,29 @@ test("al_compile_delta: shifted pre-existing stays, added unused local is new + 
   });
 });
 
+test("al_compile_delta: second call reuses the cached base and streams progress", { timeout: 600_000, skip: SKIP_NO_PACKAGES }, async () => {
+  await withRepo(async ({ app, bridge }) => {
+    writeFileSync(join(app, "src", "Diag.Codeunit.al"), HEAD);
+    const args = { projectPath: app, baseRef: "main", packageCachePath: PACKAGES };
+    const call = async () => {
+      const notes = [];
+      const res = await bridge.client.callTool({ name: "al_compile_delta", arguments: args }, undefined, {
+        onprogress: (p) => notes.push(p.message),
+        timeout: 600_000,
+      });
+      return { parsed: JSON.parse(res.content[0].text), notes };
+    };
+    const first = await call();
+    const second = await call();
+    assert.equal(first.parsed.base.cached, false);
+    assert.equal(second.parsed.base.cached, true, "base comes from the cache on the second call");
+    assert.ok(second.parsed.timingsMs.baseCompile < first.parsed.timingsMs.baseCompile);
+    assert.deepEqual(second.parsed.delta, first.parsed.delta, "cached base gives the same answer");
+    assert.ok(first.notes.some((m) => /base compile/.test(m)), `progress seen: ${JSON.stringify(first.notes)}`);
+    assert.ok(second.notes.some((m) => /base from cache/.test(m)));
+  });
+});
+
 test("al_compile_delta: a compile error yields head-errors with null warning counts", { timeout: 600_000, skip: SKIP_NO_PACKAGES }, async () => {
   await withRepo(async ({ app, bridge }) => {
     writeFileSync(join(app, "src", "Diag.Codeunit.al"), cu(PROC_A.replace("    end;\n", "        NotAThing := 1;\n    end;\n")));

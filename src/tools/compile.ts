@@ -31,8 +31,8 @@ import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import type { BridgeConfig } from "../config.js";
-import { resolveWorkspaceSettings } from "../config.js";
+import { resolveWorkspaceSettings, type BridgeConfig } from "../config.js";
+import { CancelledError, acquireAlcSlot } from "./alcSlots.js";
 
 // ---------------------------------------------------------------------------
 // MCP-facing input schema
@@ -239,7 +239,10 @@ class CompileError extends Error {
 
 export function createCompile(config: BridgeConfig) {
   const alcPath = resolveAlcPath(config.languageServerPath);
-  return async (input: CompileInputT): Promise<CompileResult> => {
+  return async (
+    input: CompileInputT,
+    ctx: { signal?: AbortSignal; progress?: (message: string) => void } = {},
+  ): Promise<CompileResult> => {
     if (!existsSync(alcPath)) {
       throw new CompileError(
         `AL compiler not found at ${alcPath}. The bridge derives this from AL_LS_PATH; point AL_LS_PATH at the EditorServices host that ships alongside alc.`,
@@ -289,6 +292,8 @@ export function createCompile(config: BridgeConfig) {
       warningsAsErrors: input.warningsAsErrors,
       continueOnError: input.continueOnError,
       timeoutMs: config.timeouts.compileMs,
+      signal: ctx.signal,
+      onWait: ctx.progress,
     });
 
     const appPath = input.generateCode === false ? undefined : locateAppOutput(projectPath, input.outputPath);
@@ -328,6 +333,10 @@ export interface AlcCompileParams {
    *  Diagnostics come from the errorlog file, so the console text is only a
    *  crash clue and a bounded tail is enough. */
   maxOutputChars?: number;
+  /** Aborts the slot wait or kills a running alc (CancelledError). */
+  signal?: AbortSignal;
+  /** Progress text while waiting for a machine-wide alc slot. */
+  onWait?: (message: string) => void;
 }
 
 export interface AlcCompileRun {
@@ -345,6 +354,13 @@ export interface AlcCompileRun {
  * returned diagnostics are 0-based (see parseErrorLog).
  */
 export async function runAlcCompile(p: AlcCompileParams): Promise<AlcCompileRun> {
+  const slot = await acquireAlcSlot({
+    // A lock older than any alc run is a leftover, never a live compile.
+    staleMs: p.timeoutMs > 0 ? p.timeoutMs + 60_000 : 0,
+    waitMs: resolveSlotWaitMs(p.timeoutMs),
+    signal: p.signal,
+    onWait: p.onWait,
+  });
   const tmpDir = mkdtempSync(join(tmpdir(), "al-compile-"));
   const errorLogPath = join(tmpDir, "errors.json");
 
@@ -380,18 +396,26 @@ export async function runAlcCompile(p: AlcCompileParams): Promise<AlcCompileRun>
   }
 
   try {
-    const res = await runAlc(p.alcPath, args, p.timeoutMs, p.maxOutputChars);
+    const res = await runAlc(p.alcPath, args, p.timeoutMs, p.maxOutputChars, p.signal);
     // Read the errorlog before cleanup. If alc crashed there may be none.
     const errorLogWritten = existsSync(errorLogPath);
     const diagnostics = errorLogWritten ? parseErrorLog(readFileSync(errorLogPath, "utf8")) : [];
     return { diagnostics, exitCode: res.exitCode, stdout: res.stdout, stderr: res.stderr, errorLogWritten };
   } finally {
+    slot.release();
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {
       // best-effort cleanup — tmpdir entries expire on reboot anyway
     }
   }
+}
+
+/** How long to wait for a free alc slot: AL_BRIDGE_SLOT_WAIT_MS, else one alc deadline. */
+export function resolveSlotWaitMs(compileMs: number, env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number(env.AL_BRIDGE_SLOT_WAIT_MS?.trim());
+  if (Number.isFinite(n) && n >= 0 && env.AL_BRIDGE_SLOT_WAIT_MS?.trim()) return n;
+  return compileMs > 0 ? compileMs : 600_000;
 }
 
 // ---------------------------------------------------------------------------
@@ -626,15 +650,31 @@ function runAlc(
   args: string[],
   timeoutMs: number,
   maxOutputChars?: number,
+  signal?: AbortSignal,
 ): Promise<AlcRunResult> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(alcPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+    if (signal?.aborted) {
+      rejectPromise(new CancelledError("alc"));
+      return;
+    }
+    const child = spawn(alcPath, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let stdout = "";
     let stderr = "";
     let timer: NodeJS.Timeout | undefined;
+    const onAbort = () => {
+      clear();
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+      rejectPromise(new CancelledError("alc"));
+    };
     const clear = () => {
       if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
     };
+    signal?.addEventListener("abort", onAbort, { once: true });
     // Trim at twice the cap so the slice runs rarely, not on every chunk.
     const append = (acc: string, b: Buffer) => {
       const next = acc + b.toString("utf8");

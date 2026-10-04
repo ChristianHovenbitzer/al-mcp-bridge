@@ -24,7 +24,35 @@ import {
 } from "./codeActions.js";
 import { RunTestsInput, createRunTests } from "./runTests.js";
 import { CompileInput, createCompile } from "./compile.js";
-import { CompileDeltaInput, createCompileDelta } from "./compileDelta/index.js";
+import { CompileDeltaInput, createCompileDelta, type ToolContext } from "./compileDelta/index.js";
+
+/** The slice of the SDK's RequestHandlerExtra the bridge uses. */
+interface ToolExtra {
+  signal?: AbortSignal;
+  _meta?: { progressToken?: string | number };
+  sendNotification?: (n: {
+    method: "notifications/progress";
+    params: { progressToken: string | number; progress: number; message?: string };
+  }) => Promise<void>;
+}
+
+/**
+ * notifications/progress sender for one call, or undefined when the client
+ * sent no progressToken. `progress` must increase per the MCP spec, so it is
+ * a step counter; the human-readable phase goes in `message`.
+ */
+function progressReporter(extra: ToolExtra | undefined): ((message: string) => void) | undefined {
+  const token = extra?._meta?.progressToken;
+  const send = extra?.sendNotification;
+  if (token === undefined || !send) return undefined;
+  let step = 0;
+  return (message) => {
+    step++;
+    send({ method: "notifications/progress", params: { progressToken: token, progress: step, message } }).catch(() => {
+      // The client went away; progress is best-effort.
+    });
+  };
+}
 import { PublishInput, createPublish } from "./publish.js";
 import {
   ListWorkspacesInput,
@@ -81,19 +109,36 @@ export function registerTools(
   const register = mcp.registerTool.bind(mcp) as unknown as (
     name: string,
     config: { description: string; inputSchema: ZodRawShape },
-    cb: (input: any) => Promise<{ content: Array<{ type: "text"; text: string }> }>,
+    cb: (input: any, extra: ToolExtra) => Promise<{ content: Array<{ type: "text"; text: string }> }>,
   ) => void;
 
   const tool = (
     name: string,
     description: string,
     inputSchema: ZodRawShape,
-    handler: (input: any) => Promise<unknown>,
+    handler: (input: any, ctx: ToolContext) => Promise<unknown>,
     timeoutMs = t.toolMs,
   ): void => {
-    register(name, { description, inputSchema }, async (input) =>
-      json(await withTimeout(handler(input), timeoutMs, `tool ${name}`)),
-    );
+    register(name, { description, inputSchema }, async (input, extra) => {
+      // One abort for both ways a call ends early: the client cancels, or
+      // the outer deadline fires. Long-running handlers (alc) kill their
+      // child on it instead of running on invisibly after the error.
+      const abort = new AbortController();
+      const onClientAbort = () => abort.abort();
+      extra?.signal?.addEventListener("abort", onClientAbort, { once: true });
+      try {
+        return json(
+          await withTimeout(
+            handler(input, { signal: abort.signal, progress: progressReporter(extra) }),
+            timeoutMs,
+            `tool ${name}`,
+            () => abort.abort(),
+          ),
+        );
+      } finally {
+        extra?.signal?.removeEventListener("abort", onClientAbort);
+      }
+    });
   };
 
   /** Reject inputs whose `file` path isn't under any loaded workspace.
@@ -259,7 +304,7 @@ export function registerTools(
       "Defaults for analyzers, package cache, and ruleset come from the bridge's resolved config (same as the LSP), " +
       "but can be overridden per call. Runs on Linux - does not depend on the MS `al-mcp` server.",
     CompileInput.shape,
-    async (input) => compile(input),
+    async (input, ctx) => compile(input, ctx),
     // The alc child enforces its own kill deadline; keep the outer guard above
     // it so the inner error (with partial output) is what surfaces.
     t.compileMs + 30_000,
@@ -277,7 +322,7 @@ export function registerTools(
       "analyzers, so its warning counts are null, never 0, and the verdict is inconclusive or head-errors. Errors " +
       "present on both sides are `environmental` (usually the symbol cache). A missing AiCop never yields clean.",
     CompileDeltaInput.shape,
-    async (input) => compileDelta(input),
+    async (input, ctx) => compileDelta(input, ctx),
     t.compileDeltaMs,
   );
 

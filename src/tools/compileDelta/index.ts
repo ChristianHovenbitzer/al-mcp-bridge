@@ -24,6 +24,7 @@ import {
   type AlcCompileRun,
   type CompileDiagnostic,
 } from "../compile.js";
+import { BaseCache, MATCHER_SCHEMA_VERSION, computeKey, type CachedBase } from "./cache.js";
 import { parseDiff } from "./diffMap.js";
 import {
   CompileDeltaError,
@@ -83,7 +84,17 @@ export const CompileDeltaInput = z.object({
   packageCachePath: z.string().optional().describe("Symbol cache override (same precedence as al_compile)."),
   analyzers: z.array(z.string()).optional().describe("Analyzer DLL override (same semantics as al_compile)."),
   ruleSet: z.string().optional().describe("Ruleset override (same semantics as al_compile)."),
+  useBaseCache: z
+    .boolean()
+    .default(true)
+    .describe("Reuse the cached base result (keyed on base sha, ruleset, analyzers, symbol contents, alc). false recompiles the base and refreshes the entry."),
 });
+
+/** Per-call hooks the MCP layer supplies: cancellation and progress text. */
+export interface ToolContext {
+  signal?: AbortSignal;
+  progress?: (message: string) => void;
+}
 
 export type CompileDeltaInputT = z.infer<typeof CompileDeltaInput>;
 
@@ -106,7 +117,7 @@ export interface InlineRow {
 export interface CompileDeltaResult {
   verdict: Verdict;
   lineBase: 1;
-  base: { ref: string; sha: string; cached: false; counts: Counts; analyzersSuppressed: boolean };
+  base: { ref: string; sha: string; cached: boolean; counts: Counts; analyzersSuppressed: boolean };
   head: { ref: string; sha: string; dirty: boolean; counts: Counts; analyzersSuppressed: boolean };
   delta: {
     new: number;
@@ -237,7 +248,9 @@ export function orderNew(rows: NewRow[]): NewRow[] {
 
 export function createCompileDelta(config: BridgeConfig) {
   const alcPath = resolveAlcPath(config.languageServerPath);
-  return async (input: CompileDeltaInputT): Promise<CompileDeltaResult> => {
+  const baseCache = new BaseCache(join(deltaRoot(), "cache"), { lockStaleMs: config.timeouts.compileMs + 60_000 });
+  return async (input: CompileDeltaInputT, ctx: ToolContext = {}): Promise<CompileDeltaResult> => {
+    const progress = (message: string) => ctx.progress?.(message);
     if (!existsSync(alcPath)) {
       throw new CompileDeltaError("ALC_NOT_FOUND", `AL compiler not found at ${alcPath}. Point AL_LS_PATH at the EditorServices host that ships alongside alc.`);
     }
@@ -277,31 +290,40 @@ export function createCompileDelta(config: BridgeConfig) {
       const t0 = Date.now();
       const baseDir = join(sandbox, "base");
       const headDir = join(sandbox, "head");
-      snapshotCommit(repo, base.sha, baseDir);
+      progress("snapshot");
       let untracked: string[] = [];
       if (worktreeHead) {
         untracked = snapshotWorktree(projectPath, headDir).untracked;
       } else {
         snapshotCommit(repo, headSha, headDir);
       }
-      // Diff right after the snapshot, so both describe the same moment.
+      // Diff right after the head snapshot, so both describe the same moment.
       const diff = parseDiff(diffU0(projectPath, base.sha, worktreeHead ? undefined : headSha));
       const tSnap = Date.now() - t0;
 
       const compileSide = async (dir: string, side: "base" | "head") => {
-        const run = await runAlcCompile({
-          alcPath,
-          projectPath: dir,
-          packageCachePaths,
-          assemblyProbingPaths: config.assemblyProbingPaths,
-          analyzers,
-          ruleSet,
-          enableExternalRulesets: true,
-          generateCode: false,
-          continueOnError: true,
-          timeoutMs: config.timeouts.compileMs,
-          maxOutputChars: 64 * 1024,
-        });
+        progress(`${side} compile`);
+        const heartbeat = setInterval(() => progress(`${side} compile (still running)`), 15_000);
+        let run: AlcCompileRun;
+        try {
+          run = await runAlcCompile({
+            alcPath,
+            projectPath: dir,
+            packageCachePaths,
+            assemblyProbingPaths: config.assemblyProbingPaths,
+            analyzers,
+            ruleSet,
+            enableExternalRulesets: true,
+            generateCode: false,
+            continueOnError: true,
+            timeoutMs: config.timeouts.compileMs,
+            maxOutputChars: 64 * 1024,
+            signal: ctx.signal,
+            onWait: (m) => progress(`${side}: ${m}`),
+          });
+        } finally {
+          clearInterval(heartbeat);
+        }
         if (!run.errorLogWritten) {
           throw new CompileDeltaError(
             side === "base" ? "BASE_COMPILE_FAILED" : "HEAD_COMPILE_FAILED",
@@ -310,21 +332,52 @@ export function createCompileDelta(config: BridgeConfig) {
         }
         return run;
       };
-      // Sequential on purpose: two GC-sized alc runs at once is how the 16 GB machine starts paging.
+
+      // Base: from the cache when nothing that shapes its diagnostics changed.
+      // Sequential with the head on purpose: two GC-sized alc runs at once is
+      // how the 16 GB machine starts paging.
       const t1 = Date.now();
-      const baseRun = await compileSide(baseDir, "base");
+      const computeBase = async (key: string, remoteRuleset: boolean): Promise<CachedBase> => {
+        snapshotCommit(repo, base.sha, baseDir);
+        const run = await compileSide(baseDir, "base");
+        return { schema: MATCHER_SCHEMA_VERSION, key, baseSha: base.sha, createdAt: Date.now(), remoteRuleset, rows: rowsOf(run, baseDir) };
+      };
+      const ck = await computeKey({
+        baseSha: base.sha,
+        appRel: repo.appRel,
+        ruleSet,
+        analyzers: analyzers ?? [],
+        packageCachePaths,
+        alcPath,
+        assemblyProbingPaths: config.assemblyProbingPaths,
+      });
+      let baseRows: DeltaRow[];
+      let baseCached = false;
+      // Only an explicit false bypasses: a direct (non-MCP) caller skips zod's default.
+      if (input.useBaseCache !== false) {
+        const got = await baseCache.getOrCompute(ck.key, () => computeBase(ck.key, ck.remoteRuleset), ctx.signal, progress);
+        baseRows = got.entry.rows;
+        baseCached = got.cached;
+      } else {
+        // Bypass the read, but refresh the entry for the next call.
+        const entry = await computeBase(ck.key, ck.remoteRuleset);
+        baseCache.write(entry);
+        baseRows = entry.rows;
+      }
+      if (baseCached) progress("base from cache");
       const tBase = Date.now() - t1;
       const t2 = Date.now();
       const headRun = await compileSide(headDir, "head");
       const tHead = Date.now() - t2;
 
+      progress("match");
       const t3 = Date.now();
       const keepSev = (r: DeltaRow) =>
         r.severity === "error" ||
         r.severity === "warning" ||
         (r.severity === "info" && input.includeInfo) ||
         (r.severity === "hint" && input.includeHint);
-      const baseAll = rowsOf(baseRun, baseDir).filter(keepSev);
+      const baseAll = baseRows.filter(keepSev);
       const headAll = rowsOf(headRun, headDir).filter(keepSev);
       const baseErrors = baseAll.filter((r) => r.severity === "error").length;
       const headErrors = headAll.filter((r) => r.severity === "error").length;
@@ -392,7 +445,7 @@ export function createCompileDelta(config: BridgeConfig) {
       const result: CompileDeltaResult = {
         verdict,
         lineBase: 1,
-        base: { ref: base.ref, sha: base.sha, cached: false, counts: baseCounts, analyzersSuppressed: baseSuppressed },
+        base: { ref: base.ref, sha: base.sha, cached: baseCached, counts: baseCounts, analyzersSuppressed: baseSuppressed },
         head: {
           ref: worktreeHead ? "worktree" : input.head,
           sha: headSha,
@@ -430,7 +483,7 @@ export function createCompileDelta(config: BridgeConfig) {
         },
         ...(fullReportPath ? { fullReportPath } : {}),
         timingsMs: { snapshot: tSnap, baseCompile: tBase, headCompile: tHead, match: tMatch },
-        message: summarize(verdict, m.newRows, mine, onTouched.length, environmental.length, fullReportPath),
+        message: summarize(verdict, m.newRows, mine, onTouched.length, environmental.length, fullReportPath) + (baseCached ? " Base from cache." : ""),
       };
       return result;
     } finally {
