@@ -26,6 +26,7 @@ import {
 } from "../compile.js";
 import { BaseCache, MATCHER_SCHEMA_VERSION, computeKey, type CachedBase } from "./cache.js";
 import { parseDiff } from "./diffMap.js";
+import { environmentHints } from "./envHints.js";
 import {
   CompileDeltaError,
   changedPaths,
@@ -416,6 +417,9 @@ export function createCompileDelta(config: BridgeConfig) {
             "Fix the cache (profile-trto:al-symbols) before trusting a gate result here.",
         );
       }
+      // Cache diagnosis only when errors appeared: a GC cache holding 27.4 and
+      // 27.5 side by side is normal and would be noise on every clean run.
+      if (onlyErrors) hints.push(...environmentHints(projectPath, repo.topLevel, packageCachePaths));
       if (aicop === "missing") hints.push("Socitas.AiCop.dll is not among the analyzers — AI#### rules did not run, so the verdict cannot be 'clean'.");
 
       const maxInline = resolveMaxInline(input.maxInline);
