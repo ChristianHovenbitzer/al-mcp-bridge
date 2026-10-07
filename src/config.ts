@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { type BridgeTimeouts, loadTimeouts } from "./timeouts.js";
@@ -297,7 +297,7 @@ export function loadConfig(): BridgeConfig {
     for (const entry of process.env.AL_WORKSPACE.split(";")) {
       const p = entry.trim();
       if (!p) continue;
-      const folder = resolve(p);
+      const folder = canonicalPath(p);
       if (!existsSync(folder)) {
         throw new Error(`AL_WORKSPACE entry does not exist: ${folder}`);
       }
@@ -341,6 +341,22 @@ export function loadConfig(): BridgeConfig {
 }
 
 /**
+ * Absolute, canonical form of a path: symlinks resolved and, on Windows, 8.3
+ * short names (C:\Users\RUNNER~1\...) expanded. The AL language server
+ * canonicalizes workspace folders itself; a document or workspace sent in a
+ * different spelling is treated as outside the project and gets no analyzer
+ * diagnostics. Falls back to `resolve(p)` when the path does not exist.
+ */
+export function canonicalPath(p: string): string {
+  const abs = resolve(p);
+  try {
+    return realpathSync.native(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/**
  * Point an existing `BridgeConfig` at a new set of AL project folders,
  * re-reading each folder's `.vscode/settings.json`.
  *
@@ -356,7 +372,7 @@ export function retargetWorkspaces(
   folders: string[],
 ): void {
   if (folders.length === 0) throw new Error("retargetWorkspaces: no folders given");
-  const resolved = folders.map((f) => resolve(f));
+  const resolved = folders.map((f) => canonicalPath(f));
   const settings = new Map<string, AlWorkspaceSettings>();
   for (const folder of resolved) {
     settings.set(folder, resolveWorkspaceSettings(folder, config.languageServerPath));

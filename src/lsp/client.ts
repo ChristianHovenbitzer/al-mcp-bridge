@@ -17,7 +17,7 @@ import type {
   PublishDiagnosticsParams,
   WorkspaceEdit,
 } from "vscode-languageserver-protocol";
-import type { AlWorkspaceSettings, BridgeConfig } from "../config.js";
+import { canonicalPath, type AlWorkspaceSettings, type BridgeConfig } from "../config.js";
 import { withTimeout } from "../timeouts.js";
 import { DiagnosticsCache } from "./diagnostics.js";
 
@@ -569,7 +569,9 @@ export class AlLspClient {
    * freezing at the text seen at first open.
    */
   async openDocument(absolutePath: string): Promise<string> {
-    const uri = pathToFileURL(absolutePath).toString();
+    // Same spelling as the workspace folders (see canonicalPath), or the LS
+    // treats the file as outside the project.
+    const uri = pathToFileURL(canonicalPath(absolutePath)).toString();
     const text = readFileSync(absolutePath, "utf8");
 
     if (!this.openVersions.has(uri)) {

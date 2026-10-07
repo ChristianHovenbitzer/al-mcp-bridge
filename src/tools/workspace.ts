@@ -1,7 +1,7 @@
 import { existsSync, statSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { join, sep } from "node:path";
 import { z } from "zod";
-import { resolveWorkspaceSettings } from "../config.js";
+import { canonicalPath, resolveWorkspaceSettings } from "../config.js";
 import type { BridgeConfig } from "../config.js";
 import type { AlLspClient } from "../lsp/client.js";
 
@@ -38,7 +38,7 @@ export interface LoadWorkspaceResult {
 
 export function createLoadWorkspace(client: AlLspClient, config: BridgeConfig) {
   return async (input: LoadWorkspaceInputT): Promise<LoadWorkspaceResult> => {
-    const folder = resolve(input.path);
+    const folder = canonicalPath(input.path);
     if (!existsSync(folder) || !statSync(folder).isDirectory()) {
       throw new Error(`Path is not an existing directory: ${folder}`);
     }
@@ -112,9 +112,9 @@ export function createListWorkspaces(client: AlLspClient, config: BridgeConfig) 
  * `/a/bb`.
  */
 export function isPathInWorkspace(filePath: string, folders: string[]): boolean {
-  const file = resolve(filePath);
+  const file = canonicalPath(filePath);
   for (const folder of folders) {
-    const root = resolve(folder);
+    const root = canonicalPath(folder);
     if (file === root) return true;
     if (file.startsWith(root + sep)) return true;
   }
