@@ -36,6 +36,10 @@
     "version": "17.0.2273547",
     "_comment": "Pinned AL VS Code extension version used by the e2e test harness. Bump together with tests/.al-ls/ cache invalidation."
   },
+  "alcops": {
+    "version": "1.3.1",
+    "_comment": "ALCops.Analyzers NuGet version the e2e harness adds to a VSIX-extracted AL LS. The VSIX does not ship ALCops; a VS Code install only has them when the ALCops extension copied them in."
+  },
   "dependencies": {
     "@microsoft/signalr": "^10.0.0",
     "@modelcontextprotocol/sdk": "^1.0.4",

@@ -9,8 +9,16 @@ on:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        # Git Bash on Windows, so the steps below run unchanged on both OSes.
+        shell: bash
 
     steps:
       - uses: actions/checkout@v4
@@ -65,5 +73,5 @@ jobs:
         with:
           name: al-ls-log
           path: |
-            tests/.al-ls/**/bin/linux/EditorServices.log
+            tests/.al-ls/**/EditorServices.log
           if-no-files-found: ignore

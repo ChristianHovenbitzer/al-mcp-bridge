@@ -2,8 +2,9 @@
 /**
  * Make a real AL language server available to the test suite.
  *
- * Linux-only for now — we shell out to `unzip` for VSIX extraction. If you
- * need Windows or a machine without unzip, swap in a pure-Node extractor.
+ * Linux, macOS and Windows. VSIX extraction shells out to `unzip` on
+ * Linux/macOS and to the bsdtar that ships with Windows (System32\tar.exe,
+ * which reads zip archives) on Windows.
  *
  * Resolution order:
  *   1. AL_LS_PATH in env — already pointed at a binary, we just record it.
@@ -12,8 +13,10 @@
  *      equivalent.) Contributors who already develop AL on this machine pay
  *      zero download cost.
  *   3. Download the VSIX from the marketplace once, cache it under
- *      `tests/.al-ls/vsix-cache/`, extract only `bin/linux/` plus
- *      `bin/Analyzers/` to `tests/.al-ls/<version>/`.
+ *      `tests/.al-ls/vsix-cache/`, extract only `bin/<platform>/` plus
+ *      `bin/Analyzers/` to `tests/.al-ls/<version>/`. The VSIX carries only
+ *      Microsoft's cops, so the ALCops.Analyzers NuGet package (version pinned
+ *      in package.json `alcops.version`) is added to `bin/Analyzers/`.
  *
  * In all cases we write `tests/.al-ls/current.json` with the absolute paths
  * the test helper needs. Idempotent — re-running with everything in place is
@@ -44,6 +47,7 @@ const OUT_ROOT = join(REPO_ROOT, "tests", ".al-ls");
 
 const pkg = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8"));
 const VERSION = process.env.AL_EXT_VERSION ?? pkg.alLanguageServer?.version;
+const ALCOPS_VERSION = process.env.ALCOPS_VERSION ?? pkg.alcops?.version;
 if (!VERSION) {
   console.error(
     "[install-al-ls] no version pinned. Set alLanguageServer.version in " +
@@ -52,16 +56,20 @@ if (!VERSION) {
   process.exit(2);
 }
 
-if (process.platform !== "linux") {
+// The VSIX ships one host per OS under bin/<platform>/, named after Node's
+// process.platform values.
+const SUPPORTED_PLATFORMS = ["linux", "darwin", "win32"];
+if (!SUPPORTED_PLATFORMS.includes(process.platform)) {
   console.error(
-    `[install-al-ls] platform ${process.platform} is not supported yet. ` +
+    `[install-al-ls] platform ${process.platform} is not supported. ` +
       "Set AL_LS_PATH manually or extend this script.",
   );
   process.exit(2);
 }
 
-const PLATFORM = "linux";
-const LS_BIN_NAME = "Microsoft.Dynamics.Nav.EditorServices.Host";
+const PLATFORM = process.platform;
+const IS_WINDOWS = PLATFORM === "win32";
+const LS_BIN_NAME = "Microsoft.Dynamics.Nav.EditorServices.Host" + (IS_WINDOWS ? ".exe" : "");
 
 function log(msg) {
   process.stderr.write(`[install-al-ls] ${msg}\n`);
@@ -87,6 +95,12 @@ function findLocalExtensionInstall(version) {
   return null;
 }
 
+/** Windows' own bsdtar. Called by absolute path because a Git-for-Windows
+ *  GNU tar earlier on PATH cannot read zip archives. */
+function windowsTarPath() {
+  return join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe");
+}
+
 function assertUnzipAvailable() {
   const probe = spawnSync("unzip", ["-v"], { stdio: "ignore" });
   if (probe.status !== 0) {
@@ -107,13 +121,47 @@ async function downloadVsix(version) {
     return target;
   }
 
-  const url = `https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/${version}/vspackage`;
-  log(`downloading ${url}`);
-  const res = await fetch(url, { redirect: "follow" });
-  if (!res.ok || !res.body) {
-    throw new Error(`vsix download failed: ${res.status} ${res.statusText}`);
-  }
+  await download(
+    `https://marketplace.visualstudio.com/_apis/public/gallery/publishers/ms-dynamics-smb/vsextensions/al/${version}/vspackage`,
+    target,
+  );
+  return target;
+}
 
+/** Extract the entries under `dirs` (archive-relative folder paths) from a
+ *  zip archive (VSIX / nupkg) into `dest`. */
+function extractZipDirs(zipPath, dirs, dest) {
+  if (!IS_WINDOWS) assertUnzipAvailable();
+  const result = IS_WINDOWS
+    ? spawnSync(windowsTarPath(), ["-xf", zipPath, "-C", dest, ...dirs], { stdio: "inherit" })
+    : spawnSync("unzip", ["-q", "-o", zipPath, ...dirs.map((d) => `${d}/*`), "-d", dest], {
+        stdio: "inherit",
+      });
+  if (result.status !== 0) {
+    throw new Error(`extracting ${zipPath} failed with status ${result.status ?? result.error}`);
+  }
+}
+
+/** fetch with a few retries — a single transient network error should not
+ *  fail a CI run. */
+async function fetchWithRetry(url, attempts = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      return await fetch(url, { redirect: "follow" });
+    } catch (err) {
+      if (i >= attempts) throw err;
+      log(`fetch failed (${err?.cause?.code ?? err?.message}), retry ${i}/${attempts - 1}`);
+      await new Promise((r) => setTimeout(r, 2000 * i));
+    }
+  }
+}
+
+async function download(url, target) {
+  log(`downloading ${url}`);
+  const res = await fetchWithRetry(url);
+  if (!res.ok || !res.body) {
+    throw new Error(`download failed: ${res.status} ${res.statusText} (${url})`);
+  }
   const tmp = target + ".partial";
   const sink = createWriteStream(tmp);
   const reader = res.body.getReader();
@@ -131,11 +179,54 @@ async function downloadVsix(version) {
   );
   renameSync(tmp, target);
   log(`downloaded ${bytes} bytes → ${target}`);
-  return target;
+}
+
+/** Target framework of the LS host (e.g. "net8.0"), so the matching ALCops
+ *  build is picked. */
+function hostTfm(lsPath) {
+  const cfg = lsPath.replace(/\.exe$/, "") + ".runtimeconfig.json";
+  const tfm = existsSync(cfg) ? JSON.parse(readFileSync(cfg, "utf8")).runtimeOptions?.tfm : undefined;
+  if (!tfm) throw new Error(`cannot read the target framework from ${cfg}`);
+  return tfm;
+}
+
+/** Add ALCops.Analyzers to a VSIX-extracted Analyzers folder. Idempotent. */
+async function installAlcops(analyzersDir, lsPath) {
+  if (!ALCOPS_VERSION) {
+    log("no alcops.version pinned — skipping ALCops");
+    return;
+  }
+  if (existsSync(join(analyzersDir, "ALCops.LinterCop.dll"))) {
+    log(`ALCops already present in ${analyzersDir}`);
+    return;
+  }
+  const tfm = hostTfm(lsPath);
+  const cacheDir = join(OUT_ROOT, "nupkg-cache");
+  mkdirSync(cacheDir, { recursive: true });
+  const nupkg = join(cacheDir, `alcops.analyzers.${ALCOPS_VERSION}.nupkg`);
+  if (!existsSync(nupkg) || statSync(nupkg).size === 0) {
+    await download(
+      `https://api.nuget.org/v3-flatcontainer/alcops.analyzers/${ALCOPS_VERSION}/alcops.analyzers.${ALCOPS_VERSION}.nupkg`,
+      nupkg,
+    );
+  }
+  const staging = mkdtempSync(join(tmpdir(), "alcops-extract-"));
+  try {
+    extractZipDirs(nupkg, [`lib/${tfm}`], staging);
+    const libDir = join(staging, "lib", tfm);
+    if (!existsSync(libDir)) {
+      throw new Error(`ALCops.Analyzers ${ALCOPS_VERSION} has no lib/${tfm} build`);
+    }
+    for (const name of readdirSync(libDir).filter((n) => n.endsWith(".dll"))) {
+      cpSync(join(libDir, name), join(analyzersDir, name));
+    }
+  } finally {
+    rmSync(staging, { recursive: true, force: true });
+  }
+  log(`added ALCops.Analyzers ${ALCOPS_VERSION} (${tfm}) → ${analyzersDir}`);
 }
 
 function extractVsix(vsixPath, outDir) {
-  assertUnzipAvailable();
   if (existsSync(outDir)) rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
 
@@ -144,22 +235,7 @@ function extractVsix(vsixPath, outDir) {
   // Code extension directory (<outDir>/bin/...).
   const staging = mkdtempSync(join(tmpdir(), "al-ls-extract-"));
   try {
-    const result = spawnSync(
-      "unzip",
-      [
-        "-q",
-        "-o",
-        vsixPath,
-        `extension/bin/${PLATFORM}/*`,
-        "extension/bin/Analyzers/*",
-        "-d",
-        staging,
-      ],
-      { stdio: "inherit" },
-    );
-    if (result.status !== 0) {
-      throw new Error(`unzip failed with status ${result.status}`);
-    }
+    extractZipDirs(vsixPath, [`extension/bin/${PLATFORM}`, "extension/bin/Analyzers"], staging);
     const extRoot = join(staging, "extension");
     if (!existsSync(extRoot)) {
       throw new Error(`expected ${extRoot} after unzip; VSIX layout changed?`);
@@ -175,7 +251,12 @@ function extractVsix(vsixPath, outDir) {
   if (!existsSync(lsPath)) {
     throw new Error(`LS binary missing after extract: ${lsPath}`);
   }
-  chmodSync(lsPath, 0o755);
+  if (!IS_WINDOWS) {
+    // Zip entries carry no reliable exec bit; both the host and alc are spawned.
+    chmodSync(lsPath, 0o755);
+    const alcPath = join(outDir, "bin", PLATFORM, "alc");
+    if (existsSync(alcPath)) chmodSync(alcPath, 0o755);
+  }
   log(`extracted → ${outDir}`);
 }
 
@@ -220,6 +301,7 @@ async function main() {
   } else {
     log(`extraction cache hit: ${versionDir}`);
   }
+  await installAlcops(extractedAnalyzers, extractedLs);
 
   writeCurrent({
     version: VERSION,
