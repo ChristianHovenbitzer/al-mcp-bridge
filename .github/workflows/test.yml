@@ -17,7 +17,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # 22+: `node --test` only expands the tests/**/*.test.mjs globs from Node 21 on.
+          node-version: "22"
           cache: npm
 
       - name: Read pinned AL LS version
@@ -49,6 +50,9 @@ jobs:
 
       - name: Typecheck
         run: npm run typecheck
+
+      - name: Run unit tests
+        run: npm run test:unit
 
       - name: Run e2e tests
         run: npm run test:e2e
