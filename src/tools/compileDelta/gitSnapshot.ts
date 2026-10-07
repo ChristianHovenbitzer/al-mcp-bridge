@@ -12,7 +12,7 @@
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export class CompileDeltaError extends Error {
   constructor(
@@ -66,7 +66,12 @@ export function repoInfo(projectPath: string): RepoInfo {
     throw new CompileDeltaError("NOT_A_GIT_REPO", `${projectPath} is not inside a git repository.`);
   }
   const topLevel = resolve(top);
-  const appRel = relative(topLevel, resolve(projectPath)).split(sep).join("/");
+  // Ask git for the project's path inside the repo instead of computing
+  // relative(topLevel, projectPath): git reports the top level in its long,
+  // resolved form, so a Windows 8.3 short name (C:\Users\RUNNER~1\...), a
+  // symlink or a case difference in projectPath would yield "../../..".
+  const prefix = gitTry(projectPath, ["rev-parse", "--show-prefix"]) ?? "";
+  const appRel = prefix.replace(/\/+$/, "");
   return { topLevel, appRel };
 }
 
