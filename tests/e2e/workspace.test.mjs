@@ -7,7 +7,7 @@
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startBridge, fixturePath } from "../helpers/bridge.mjs";
@@ -93,8 +93,10 @@ test("al_load_workspace registers a new project and the guard then accepts its f
   const load = await bridge.callTool("al_load_workspace", { path: secondaryProject });
   assert.equal(load.parsed?.added, true, `expected added=true, got ${load.raw}`);
   assert.equal(load.parsed?.alreadyLoaded, false);
+  // The bridge reports folders in canonical form; on Windows tmpdir() can be
+  // an 8.3 short name (C:\Users\RUNNER~1\...), so compare canonically.
   assert.ok(
-    load.parsed.workspaceFolders.includes(secondaryProject),
+    load.parsed.workspaceFolders.includes(realpathSync.native(secondaryProject)),
     `secondary not in workspace folders: ${JSON.stringify(load.parsed.workspaceFolders)}`,
   );
 
